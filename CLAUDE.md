@@ -119,3 +119,15 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 
 - native CUDA 既定 backend / cuda-oxide oracle / nightly toolchain の構成は壊さない、
   host 側 unsafe は妥当性をコメントで明記する
+
+## NNUE 新アーキテクチャの設計仕様
+
+新しいネットワークアーキテクチャ (入力特徴・出力バケット・補助ヘッド等) の追加は
+[docs/nnue-architecture-ideas.md](docs/nnue-architecture-ideas.md) に従う。
+
+- 1 セッションで扱うのは仕様書のアイデア 1 つ (ID で指定) だけ。
+- 推論エンジンはフォーク `yjbg9201/YaneuraOu` を同時に改造する。同じ文書が同リポの
+  `docs/` にもある。
+- 仕様書と実ソースが食い違ったら実ソースを優先し、差異を報告する。
+- 仕様書の ID (`A2` 等) は作業管理用のラベルなので、コードの識別子・ファイル名には
+  使わず、内容を表す名前を付ける (上の「コードコメント規約」と同じ扱い)。
