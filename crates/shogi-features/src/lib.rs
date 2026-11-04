@@ -6,11 +6,14 @@
 //!   合法局面の active 数固定 40)、NNUE 1536-16-32 trainer の入力。
 //! - `progress_kpabs`: KP-absolute 特徴 (`81 * FE_OLD_END` 次元) と
 //!   logistic regression による `0..=1` progress / N-bucket 割当 (caller が N を指定)。
+//! - `nyugyoku_scalar`: L1 入力に連結する入玉スカラー特徴 (入玉宣言の点数勘定と
+//!   宣言条件までの距離、u8 96 次元)。
 
 pub mod effect_bucket;
 pub mod feature_set;
 pub mod halfka_hm;
 pub mod kingrank9;
+pub mod nyugyoku_scalar;
 pub mod progress_kpabs;
 pub mod psqt_material;
 mod simd;
@@ -29,6 +32,11 @@ pub use halfka_hm::{
     SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, SHOGI_HALFKA_HM_NUM_FEATURES, ShogiHalfKA_hm,
 };
 pub use kingrank9::{KINGRANK9_NUM_BUCKETS, kingrank9_bucket_board};
+pub use nyugyoku_scalar::{
+    DeclarationRule, KingDeclarationState, NYUGYOKU_SCALAR_BLOCK_DIMS, NYUGYOKU_SCALAR_DIMS,
+    NyugyokuScalarConfig, ScalarEncoding, king_declaration_state, nyugyoku_scalars,
+    nyugyoku_scalars_f32,
+};
 pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};
 pub use threat::{THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, threat_dimensions_of};
