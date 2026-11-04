@@ -98,6 +98,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **GitHub Issue を立てない課題の spec は `docs/issue/` に置く。同 directory も
   `.gitignore` 済み**で git 管理外。1 file = 1 issue とし、対応 PR の merge 後に
   file を削除する (= close)。運用詳細は同 directory の README.md。
+- **例外: `docs/nnue-*` / `docs/adr-*`** (NNUE 新アーキテクチャの設計仕様書と、その
+  判断記録) は上の「dated header 禁止」「ADR・設計判断は repo に置かない」の対象外。
+  仕様書の版・出典の日付と、調査結果・決定事項をそのまま残してよい。
 - **directory tree / 構成図は現状を反映**。「将来こうする」予定や削除済 directory
   を残さない。
 - **dated 検証ブロック禁止**: 「2026-05-11 に X 環境で確認」型の log は
