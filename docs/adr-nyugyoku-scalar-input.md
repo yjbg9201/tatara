@@ -244,6 +244,11 @@ BonaPiece、ハッシュ `0xA20DCB9B`) が既にある。仕様書の「A2」と
 
 ## 5. 段階計画への反映
 
+実施順は **1 → 2 → 3 → 5 → 4 → 6** (hs 決定)。段階5の量子化 CPU forward と YaneuraOu 側の
+推論は乱数の重みで integer-exact 突合でき、GPU なしで検証を完了できるため先に行う。
+段階5で使う L1 入力次元のデータ定義 (`SimpleId::combined_dim()` の 608 化など) は段階5で
+入れ、FP32 融合カーネルの行幅引数化など GPU 経路の変更は段階4に残す。
+
 | 段階 | 変更点 |
 |---|---|
 | 2 (スカラー計算) | `shogi-features` にスカラー計算、`shogi-format` に SFEN パーサを追加。YaneuraOu は `source/eval/nnue/features/nyugyoku_scalar.h` (仮)。golden ファイルを作る |

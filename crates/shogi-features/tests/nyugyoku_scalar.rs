@@ -2,9 +2,10 @@
 //!
 //! golden ファイル `tests/data/nyugyoku_scalar_golden.tsv` は YaneuraOu 側
 //! (`source/eval/nnue/features/testdata/nyugyoku_scalar_golden.tsv`) にも同一内容の
-//! コピーがあり、両リポのテストが同じ期待値で実装を検査する。ファイルを更新したら
+//! コピーがあり、両リポのテストが同じ期待値で実装を検査する。期待値は実装とコードを
+//! 共有しない参照実装 `scripts/gen-nyugyoku-scalar-golden.py` で生成する。再生成したら
 //! 両リポのコピーと [`GOLDEN_FNV1A32`] (YaneuraOu 側のテストにも同じ値がある) を
-//! そろえて更新する。
+//! スクリプトが表示する値にそろえて更新する。
 
 use shogi_features::nyugyoku_scalar::{
     DeclarationRule, NYUGYOKU_SCALAR_BLOCK_DIMS, NYUGYOKU_SCALAR_DIMS, NyugyokuScalarConfig,
