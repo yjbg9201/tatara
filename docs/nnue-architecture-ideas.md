@@ -204,6 +204,41 @@ inline IndexType MakeIndex(Square ksq, BonaPiece p) {
 - 入玉可能経路数（敵利き依存）は利き計算が必要なので初版では入れない（B1で利き計算基盤ができてから再検討）
 - 毎回O(駒数)で再計算（差分更新しない）。コストはFT差分更新に比べ無視できる
 
+**確定したブロック配置（段階2で実装）**
+
+並びは `[手番側の玉 44 | 相手側の玉 44 | 0 × 8]`。値はすべて u8（0〜127）。thermometer の各ビットと各フラグは 0 / 127。比率は `round(127 × num / den)` を整数式 `(254·num + den) / (2·den)`（0.5 は切り上げ）で求め、Rust と C++ で丸めを一致させる。
+
+thermometer:
+
+| offset | 次元 | 内容 |
+|---|---|---|
+| 0 | 8 | 前進段数 `d ≥ 1` … `d ≥ 8` |
+| 8 | 1 | 玉が敵陣 |
+| 9 | 10 | 敵陣内の駒数 `n ≥ 1` … `n ≥ 10` |
+| 19 | 10 | 宣言点数の残り `r ≤ t`（t = 0,1,2,3,5,8,12,16,20,28） |
+| 29 | 10 | 潜在宣言点数の残り（区切りは同じ） |
+| 39 | 1 | `min(持ち駒点数, 必要点) / 必要点` |
+| 40 | 1 | 宣言条件の成立 |
+| 41 | 1 | 先手フラグ |
+| 42 | 2 | 予約（0） |
+
+one-hot:
+
+| offset | 次元 | 内容 |
+|---|---|---|
+| 0 | 9 | 前進段数 `d == 0` … `d == 8` |
+| 9 | 1 | 玉が敵陣 |
+| 10 | 1 | `min(n, 10) / 10` |
+| 11 | 1 | `min(宣言点数, 必要点) / 必要点` |
+| 12 | 1 | `残り r / 必要点` |
+| 13 | 1 | `min(持ち駒点数, 必要点) / 必要点` |
+| 14 | 1 | 宣言条件の成立 |
+| 15 | 1 | 先手フラグ |
+| 16 | 28 | 未使用（0） |
+
+- one-hot 版の正規化は、旧仕様の「宣言点数/28」をルール共通の「/必要点」に置き換えた
+- 実装: tatara `crates/shogi-features/src/nyugyoku_scalar.rs`、やねうら王 `source/eval/nnue/features/nyugyoku_scalar.{h,cpp}`
+
 **フォールバック**: 実装・ビルドで問題が出た場合は、旧仕様の **one-hot＋正規化スカラー**（玉の段 one-hot 9、敵陣内駒数/10、宣言点数/28、残り点数、持ち駒点数）に切り替える。符号化は `ScalarEncoding { Thermometer, OneHot }` のフラグで持ち、両方を同じ96次元枠に収める（one-hot版は未使用部分を0）。ネットのハッシュには符号化種別とルール種別を含め、取り違えをロード時に弾く。
 
 **ネットワーク**
@@ -231,6 +266,8 @@ NyugyokuScalar[96]（手番順、u8 0〜127）──┐
 
 **段階分け（各段階を独立PRにする。T＝tatara、Y＝やねうら王）**
 
+**実施順（確定）: 1 → 2 → 3 → 5 → 4 → 6**。段階番号は内容の区分で、実施順とは一致しない。段階5（量子化 CPU forward とやねうら王側の推論）は乱数の重みで integer-exact 突合ができ、GPU なしで検証を完了できる。GPU が必要な段階4は最後に回し、draft のまま GPU 検証待ちにする（§7.1）。このため、段階5で必要になる L1 入力次元のデータ定義（`SimpleId::combined_dim()` の 608 化、ハッシュ・arch 文字列、`SimpleWeights` の列数など）は段階5で先に入れる。trainer の GPU 経路（FP32 融合カーネルの行幅引数化など）は段階4に残す
+
 1. **調査とADR**（T・Y）
    - T: Simple trainer の forward/backward で FT出力が L1 にどう渡るか（連結済みバッファか、カーネル内で直接読むか）を特定する。ここで「L1入力に列を足す」改造の難易度が決まる
    - T: `--arch` の任意次元対応の実装を確認し、L1入力次元を「2×FT幅＋96」として扱えるか判断
@@ -243,17 +280,29 @@ NyugyokuScalar[96]（手番順、u8 0〜127）──┐
    - 2言語で同じ値を返すことを保証するため、**golden 局面ファイル（SFEN と期待スカラー列）を1つ作り、両リポのテストが同じファイルを読む**
    - golden 局面: 初期局面、中盤、片側入玉、相入玉、宣言条件をちょうど満たす局面（先手28点・後手27点の境界）、境界の1点手前
    - property テスト: 盤面を180°回転し先後を入れ替えると、ブロックの並びが入れ替わる（先手フラグを除く）
+     - 先後で必要点が違う 27点法では残り点数・成立ビット・持ち駒比率もずれるので、ブロックの完全な入れ替わりは 24点法で検査し、27点法では必要点に依存しない量（前進段数・敵陣・駒数・点数）が入れ替わることを検査する
+   - **golden ファイルの置き方（確定）**: 正本は tatara の `crates/shogi-features/tests/data/nyugyoku_scalar_golden.tsv`。やねうら王の `source/eval/nnue/features/testdata/nyugyoku_scalar_golden.tsv` に同一内容をコピーする。形式は TSV（`name / rule / encoding / sfen / u8 96個`）で、全局面 × 2ルール × 2符号化。両リポのテストはファイルの FNV-1a 32bit（CR を除いたバイト列）を同じ定数と照合し、片側だけの更新を検出する
+   - **golden の生成と更新手順**: 期待値は Rust・C++ の実装とコードを共有しない参照実装 tatara `scripts/gen-nyugyoku-scalar-golden.py`（Python 標準ライブラリのみ）で生成する。ルール表（`REQUIRED_POINTS`）・区切り値（`REMAINING_POINT_THRESHOLDS`）・golden 局面（`POSITIONS`）はスクリプト冒頭の定数。CSARule24 への切替や区切り値の調整は次の順で行う
+     1. スクリプトの定数を直す（Rust・C++ の定数表も同じ値に直す）
+     2. tatara のリポジトリルートで `python3 scripts/gen-nyugyoku-scalar-golden.py --yaneuraou /path/to/YaneuraOu` を実行する。tatara の正本とやねうら王のコピーが同じ内容で書かれ、最後に FNV-1a 32bit が表示される
+     3. 表示された値を tatara `crates/shogi-features/tests/nyugyoku_scalar.rs` の `GOLDEN_FNV1A32` と、やねうら王 `source/eval/nnue/features/nyugyoku_scalar.cpp` の `kGoldenFnv1a32` に設定する
+     4. tatara の `cargo test -p shogi-features --test nyugyoku_scalar` と、やねうら王の `isready` → `unittest` の両方で確認する
+     - ブロックの次元や配置を変える場合は、ネットのハッシュも変わる（段階5）ので、golden と同時に byte-golden も更新する
+   - やねうら王側のテストは `unittest` コマンドで走る。NNUE ビルドでは `unittest` が局面評価を伴うため、事前に評価関数ファイルを読み込む（`isready`）必要がある。手元にネットが無ければ `architectures/nnue_dummy_gen.py` で作ったダミーで足りる。golden ファイルの場所は `unittest nyugyoku_scalar_golden <path>` で変えられる
+   - やねうら王側では、宣言条件の成立ビットをエンジン本体の `Position::DeclarationWin()`（`EKR_27_POINT` / `EKR_24_POINT`）とも突き合わせる
 3. **dataloader 配線**（T）
    - `Batch` に密スカラーのテンソル（batch × 96）を追加。sparse の nnz 契約は変えない
    - スカラー無しの既存プリセットでは確保しない（既存挙動を bit-identical に維持）
-4. **trainer 拡張**（T、GPU）
+4. **trainer 拡張**（T、GPU。**段階5の後に実施**）
    - L1 の入力を `[FT_stm(256) | FT_nstm(256) | scalar(96)]` とし、重み行列の列を追加
    - FP32 融合カーネル4本（`simple_ft_post_fused_{crelu,screlu}`、`simple_bwd_ft_act_{crelu,screlu}_fused`）は行幅を `2*ft_out` に固定しているので、**行幅を引数化**する（CUDA C++ と cuda-oxide の両方）。**`*_cpu` 参照実装にも同じ引数を足し、行幅 = `2*ft_out` のとき既存と完全一致することを CPU テストで確認する**
    - スカラーは `combined` の列 `[2*ft_out, 2*ft_out+96)` に書く。L1 backward は既存の Sgemm がスカラー列の重み勾配も求める（入力側には勾配を流さない）
    - 既存ネットからのワームスタート（`--init-from`）はハッシュ照合が厳密なので、スカラー無しのネットを読んで `l1_w` の列を拡張する経路を足す
    - 初期化: スカラー列の L1 重みは 0＋微小ノイズ。既存 HalfKP ネットからのワームスタート時に関数保存になることをテストで確認
    - smoke: 数 superbatch で loss が減ること、スカラー列の重みのノルムが 0 から動くこと
-5. **export と推論**（T・Y）
+5. **export と推論**（T・Y。**段階4より先に実施**）
+   - T: L1 入力次元のデータ定義を先に入れる（`SimpleId` に密入力の種別を足し、`combined_dim()` を 2×FT幅＋96 にする。`SimpleWeights` の `l1_w` 列数・ハッシュ・arch 文字列も追従させる）。GPU trainer はこの段階では密入力つきの構成を拒否してよい
+   - T・Y: 乱数の重みで export した `.bin` を使い、T の量子化 CPU forward と Y の `Evaluate()` を integer-exact で突合する（学習済みネットを待たずに検証を完了する）
    - T: スカラー列は int8（`round(x*127)`）。L1重みの列順は「FT列 → スカラー列」、パディングは32の倍数。`--scale 508` 前提（§3）
    - T・Y: 新ハッシュ値（符号化種別・ルール種別を含める）を採番し、byte-golden テストで出力バイト列を固定
    - Y: forward 直前にスカラー96次元を構築して L1 入力末尾に連結。L1 入力次元を 512→608 に拡張。ビルドフラグ（例: `NNUE_ARCHITECTURE_HALFKP_NYUGYOKU`）で既存アーキと切り替え
@@ -439,14 +488,15 @@ FT出力512 ─→ 本線 32-32-1 (eval)      loss = 通常のeval/勝敗混合
 - **2リポジトリを1セッションで扱う**: tatara とやねうら王を同じセッションに置けば、スカラー計算の共有 golden ファイルや integer-exact 突合を1つの作業の中で回せる。本書は両方のリポジトリ（または片方の `docs/`）に置き、各リポの `CLAUDE.md` から参照する
 - **クラウドセッションでできること**: 両リポの読解、Rust と C++ のコード変更、CPU で完結するテスト（スカラー計算・export の byte-golden）、やねうら王の CPU ビルドと、CPU 参照実装があれば integer-exact 突合
 - **手元の GPU マシンが必要なこと**: tatara の GPU ビルドと GPU テスト、学習 smoke、本番学習、対局による棋力測定。クラウドセッションに GPU が付くことは前提にしない
-- **推奨の分担**: 段階1・2・5・6（突合まで）はクラウドでも可。段階3・4の GPU 部分と学習・対局は手元で、Claude Code を手元のマシンで動かすか、クラウドで作ったブランチを手元で pull して実行する
+- **推奨の分担**: 段階1・2・3・5・6（突合まで）はクラウドでも可。段階4の GPU 部分と学習・対局は手元で、Claude Code を手元のマシンで動かすか、クラウドで作ったブランチを手元で pull して実行する
 
 ### 7.1 GPU テストを後回しにした先行実装（確定：2026-11-05）
 
 手元 GPU は Quadro T1000（VRAM 4GB）。HalfKP 256 程度の smoke テスト・GPU/CPU 同等性テストには足りる見込みだが、本番学習には力不足。WSL の CUDA 環境は未構築のため、それまでは以下で進める。
 
-- **先に完了させる（GPU 不要）**: 段階1（調査とADR）、段階2（スカラー計算と共有 golden）、段階3（dataloader）、段階5（export・やねうら王側の推論）、段階6のうちスカラー突合と、CPU 参照実装があれば integer-exact 突合
-- **実装だけして検証を保留する**: 段階4のうち GPU カーネル・trainer の変更。PR は **draft のまま**にし、本文に「GPU 未検証」と明記する。未検証のテスト項目をチェックリストで残す
+- **実施順は 1 → 2 → 3 → 5 → 4 → 6**（§4 A2 の段階分けを参照）
+- **先に完了させる（GPU 不要）**: 段階1（調査とADR）、段階2（スカラー計算と共有 golden）、段階3（dataloader）、段階5（L1 入力次元のデータ定義・export・量子化 CPU forward・やねうら王側の推論。乱数の重みで integer-exact 突合まで完了させる）、段階6のうちスカラー突合と integer-exact 突合
+- **最後に回して検証を保留する**: 段階4（GPU カーネルの行幅引数化・trainer の変更）。PR は **draft のまま**にし、本文に「GPU 未検証」と明記する。未検証のテスト項目をチェックリストで残す
 - **段階1で必ず確認すること**: tatara に CPU 版の forward/backward（または CPU で学習を回すモード）があるか。あれば、GPU 未構築のうちに「数ステップ学習して loss が減る」まで CPU で確認できる
 - **GPU 環境が整ったら**: draft PR の保留項目（GPU/CPU 同等性、smoke、ワームスタートの関数保存）を消化してから本マージする
 - 本番学習の GPU は別途検討（T1000 では batch とネット幅の制約が大きい）

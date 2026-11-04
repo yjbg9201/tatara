@@ -4,6 +4,7 @@ pub mod bona_piece;
 pub mod game_result;
 pub mod huffman_coded_pos;
 pub mod packed_sfen;
+pub mod sfen;
 pub mod types;
 
 pub use bona_piece::BonaPiece;
