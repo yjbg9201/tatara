@@ -614,6 +614,172 @@ fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
 }
 
 // =============================================================================
+// Huffman エンコード
+// =============================================================================
+
+/// 駒箱の駒の符号 (成り flag を 1 にした手駒符号に相当、cshogi / YaneuraOu の
+/// `huffman_table_piecebox` と同じ値)。インデックスは `HUFFMAN_TABLE` と同じ。
+/// 金は成り flag を持たないため専用の 5 bit 符号で、先後 bit を書かない。
+const HUFFMAN_PIECEBOX_TABLE: [(u32, u8); 8] = [
+    (0x00, 1), // 未使用
+    (0x02, 2), // PAWN
+    (0x09, 4), // LANCE
+    (0x0d, 4), // KNIGHT
+    (0x0b, 4), // SILVER
+    (0x2f, 6), // BISHOP
+    (0x3f, 6), // ROOK
+    (0x1b, 5), // GOLD
+];
+
+/// 平手の駒数 (玉を除く)。`HUFFMAN_TABLE` のインデックス順。盤上・手駒に無い分は
+/// 駒箱の駒として書き、合計がちょうど 256 bit になる。
+const PIECE_SET_COUNTS: [u8; 8] = [0, 18, 4, 4, 4, 2, 2, 4];
+
+/// 手駒・駒箱を書き出す駒種の順 (歩・香・桂・銀・金・角・飛)。YaneuraOu の
+/// `SfenPacker::pack` と同じ順で、同じ局面から同じバイト列を作る。
+const HAND_WRITE_ORDER: [u8; 7] = [
+    HUFFMAN_PAWN,
+    HUFFMAN_LANCE,
+    HUFFMAN_KNIGHT,
+    HUFFMAN_SILVER,
+    HUFFMAN_GOLD,
+    HUFFMAN_BISHOP,
+    HUFFMAN_ROOK,
+];
+
+fn piece_type_to_huffman_index(pt: PieceType) -> Option<u8> {
+    match pt.unpromote() {
+        PieceType::Pawn => Some(HUFFMAN_PAWN),
+        PieceType::Lance => Some(HUFFMAN_LANCE),
+        PieceType::Knight => Some(HUFFMAN_KNIGHT),
+        PieceType::Silver => Some(HUFFMAN_SILVER),
+        PieceType::Bishop => Some(HUFFMAN_BISHOP),
+        PieceType::Rook => Some(HUFFMAN_ROOK),
+        PieceType::Gold => Some(HUFFMAN_GOLD),
+        _ => None,
+    }
+}
+
+/// LSB-first で 256 bit に書くビットライタ ([`BitStream`] の逆)。
+struct BitWriter {
+    data: [u8; 32],
+    cursor: usize,
+}
+
+impl BitWriter {
+    fn write_bits(&mut self, value: u32, n: u8) -> Result<(), String> {
+        for i in 0..n {
+            if self.cursor >= 256 {
+                return Err("position does not fit in 256 bits".to_string());
+            }
+            if (value >> i) & 1 != 0 {
+                self.data[self.cursor / 8] |= 1 << (self.cursor % 8);
+            }
+            self.cursor += 1;
+        }
+        Ok(())
+    }
+}
+
+impl PackedSfen {
+    /// 局面を PackedSfen (256 bit) に符号化する。[`ShogiBoard::from_packed_sfen`] の逆で、
+    /// 盤上・手駒に無い駒は駒箱の駒として書く。
+    ///
+    /// 両玉が盤上にない局面と、駒数が平手の駒の組を超える局面は `Err`。
+    pub fn from_board(board: &ShogiBoard) -> Result<Self, String> {
+        if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
+            return Err("both kings must be on the board".to_string());
+        }
+        let mut w = BitWriter {
+            data: [0u8; 32],
+            cursor: 0,
+        };
+        let mut remaining = PIECE_SET_COUNTS;
+        let mut take = |idx: u8| -> Result<(), String> {
+            let slot = &mut remaining[idx as usize];
+            *slot = slot
+                .checked_sub(1)
+                .ok_or_else(|| "more pieces than a standard set".to_string())?;
+            Ok(())
+        };
+
+        w.write_bits(u32::from(board.side_to_move == Color::White), 1)?;
+        w.write_bits(u32::from(board.black_king_sq.0), 7)?;
+        w.write_bits(u32::from(board.white_king_sq.0), 7)?;
+
+        for (index, piece) in board.board.iter().enumerate() {
+            if index == board.black_king_sq.index() || index == board.white_king_sq.index() {
+                continue;
+            }
+            if piece.is_none() {
+                let (code, bits) = HUFFMAN_TABLE[HUFFMAN_NONE as usize];
+                w.write_bits(code, bits)?;
+                continue;
+            }
+            let idx = piece_type_to_huffman_index(piece.piece_type)
+                .ok_or_else(|| format!("unexpected piece on square {index}: {piece:?}"))?;
+            take(idx)?;
+            let (code, bits) = HUFFMAN_TABLE[idx as usize];
+            w.write_bits(code, bits)?;
+            if idx != HUFFMAN_GOLD {
+                w.write_bits(u32::from(piece.piece_type.is_promoted()), 1)?;
+            }
+            w.write_bits(u32::from(piece.color == Color::White), 1)?;
+        }
+
+        for (color, hand) in [
+            (Color::Black, &board.black_hand),
+            (Color::White, &board.white_hand),
+        ] {
+            for idx in HAND_WRITE_ORDER {
+                let pt = huffman_index_to_piece_type(idx);
+                for _ in 0..hand.count(pt) {
+                    take(idx)?;
+                    let (code, bits) = HUFFMAN_TABLE[idx as usize];
+                    w.write_bits(code >> 1, bits - 1)?;
+                    if idx != HUFFMAN_GOLD {
+                        w.write_bits(0, 1)?;
+                    }
+                    w.write_bits(u32::from(color == Color::White), 1)?;
+                }
+            }
+        }
+
+        for idx in HAND_WRITE_ORDER {
+            for _ in 0..remaining[idx as usize] {
+                let (code, bits) = HUFFMAN_PIECEBOX_TABLE[idx as usize];
+                w.write_bits(code, bits)?;
+                if idx != HUFFMAN_GOLD {
+                    w.write_bits(0, 1)?;
+                }
+            }
+        }
+
+        if w.cursor != 256 {
+            return Err(format!(
+                "encoded position has {} bits, expected 256",
+                w.cursor
+            ));
+        }
+        Ok(PackedSfen { data: w.data })
+    }
+}
+
+impl PackedSfenValue {
+    /// 局面と `board.score` / `board.ply` / `board.result` から PackedSfenValue を作る
+    /// (指し手は 0)。符号化の条件は [`PackedSfen::from_board`] と同じ。
+    pub fn from_board(board: &ShogiBoard) -> Result<Self, String> {
+        let sfen = PackedSfen::from_board(board)?;
+        let mut psv = PackedSfenValue::default();
+        psv.data[..32].copy_from_slice(&sfen.data);
+        psv.set_score(board.score);
+        psv.data[36..38].copy_from_slice(&board.ply.to_le_bytes());
+        psv.data[38] = board.result as u8;
+        Ok(psv)
+    }
+}
+
+// =============================================================================
 // 対局結果 (inherent GameResult アクセサ)
 // =============================================================================
 
