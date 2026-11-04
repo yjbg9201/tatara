@@ -1864,6 +1864,10 @@ mod cancellation_tests;
 mod hcpe_tests;
 
 #[cfg(test)]
+#[path = "dataloader_batch_layout_tests.rs"]
+mod batch_layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use shogi_features::FeatureSet;

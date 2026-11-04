@@ -262,6 +262,12 @@ impl HeldoutSet {
         self.batches.len()
     }
 
+    /// 読み込んだ検証 batch と per-position bucket。
+    #[cfg(test)]
+    pub(crate) fn batches(&self) -> &[(Batch, Vec<i32>)] {
+        &self.batches
+    }
+
     /// backend の forward + loss のみを全検証 batch に回し、平均 loss と
     /// sign-agreement accuracy を集計する。weight は一切更新しない。
     ///
