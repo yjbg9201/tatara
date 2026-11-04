@@ -98,6 +98,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **GitHub Issue を立てない課題の spec は `docs/issue/` に置く。同 directory も
   `.gitignore` 済み**で git 管理外。1 file = 1 issue とし、対応 PR の merge 後に
   file を削除する (= close)。運用詳細は同 directory の README.md。
+- **例外: `docs/nnue-*` / `docs/adr-*`** (NNUE 新アーキテクチャの設計仕様書と、その
+  判断記録) は上の「dated header 禁止」「ADR・設計判断は repo に置かない」の対象外。
+  仕様書の版・出典の日付と、調査結果・決定事項をそのまま残してよい。
 - **directory tree / 構成図は現状を反映**。「将来こうする」予定や削除済 directory
   を残さない。
 - **dated 検証ブロック禁止**: 「2026-05-11 に X 環境で確認」型の log は
@@ -119,3 +122,15 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 
 - native CUDA 既定 backend / cuda-oxide oracle / nightly toolchain の構成は壊さない、
   host 側 unsafe は妥当性をコメントで明記する
+
+## NNUE 新アーキテクチャの設計仕様
+
+新しいネットワークアーキテクチャ (入力特徴・出力バケット・補助ヘッド等) の追加は
+[docs/nnue-architecture-ideas.md](docs/nnue-architecture-ideas.md) に従う。
+
+- 1 セッションで扱うのは仕様書のアイデア 1 つ (ID で指定) だけ。
+- 推論エンジンはフォーク `yjbg9201/YaneuraOu` を同時に改造する。同じ文書が同リポの
+  `docs/` にもある。
+- 仕様書と実ソースが食い違ったら実ソースを優先し、差異を報告する。
+- 仕様書の ID (`A2` 等) は作業管理用のラベルなので、コードの識別子・ファイル名には
+  使わず、内容を表す名前を付ける (上の「コードコメント規約」と同じ扱い)。
