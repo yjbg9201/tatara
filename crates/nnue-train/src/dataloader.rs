@@ -31,7 +31,10 @@ use std::thread;
 use std::time::Duration;
 
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
+use shogi_features::{
+    FeatureSetSpec, NYUGYOKU_SCALAR_DIMS, NyugyokuScalarConfig, kingrank9_bucket_board,
+    write_nyugyoku_scalars,
+};
 use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
@@ -558,6 +561,10 @@ impl From<ShogiProgressKPAbs> for BucketMode {
 ///   Win → 1.0)
 /// - `per_pos_norm`: batch averaging 用 weight (default 1.0、trainer 側で
 ///   override 可能)
+/// - `nyugyoku_scalars`: 入玉スカラー (`nyugyoku_scalar` が `Some` のときだけ確保)。
+///   shape `[batch_size, NYUGYOKU_SCALAR_DIMS]` を flatten した u8 (0〜127)、row-major
+///   (`bi * NYUGYOKU_SCALAR_DIMS + k`)。値はエンジンの L1 入力と同じ量子化済みの値で、
+///   f32 の L1 入力にするときは `u8 / 127` に変換する
 /// - `n_positions`: 実際に詰めた数。下流はどの buffer も `n_positions` (index は
 ///   `n_positions * max_active`) までしか読まないため、`[n_positions, batch_size)` の
 ///   末尾行の内容は未規定
@@ -576,6 +583,12 @@ pub struct Batch {
     pub score: Vec<f32>,
     pub wdl: Vec<f32>,
     pub per_pos_norm: Vec<f32>,
+    /// 入玉スカラーの設定。`None` のとき `nyugyoku_scalars` は空 (未確保) で、
+    /// `push_decoded` はスカラーを計算しない。
+    pub nyugyoku_scalar: Option<NyugyokuScalarConfig>,
+    /// 入玉スカラー (`[batch_size, NYUGYOKU_SCALAR_DIMS]`、u8)。`nyugyoku_scalar` が
+    /// `None` なら空。
+    pub nyugyoku_scalars: Vec<u8>,
     pub n_positions: usize,
 }
 
@@ -583,7 +596,22 @@ impl Batch {
     /// `batch_size` × `feature_set.max_active()` の sparse 容量を持つ空
     /// `Batch` を確保。全 index は `-1` (padding)、score/wdl/norm は `0.0`。
     pub fn with_capacity(batch_size: usize, feature_set: FeatureSetSpec) -> Self {
+        Self::with_capacity_and_nyugyoku_scalars(batch_size, feature_set, None)
+    }
+
+    /// [`Batch::with_capacity`] に加え、`nyugyoku_scalar` が `Some` なら入玉スカラーの
+    /// buffer (`batch_size * NYUGYOKU_SCALAR_DIMS` 個、初期値 0) を確保する。
+    pub fn with_capacity_and_nyugyoku_scalars(
+        batch_size: usize,
+        feature_set: FeatureSetSpec,
+        nyugyoku_scalar: Option<NyugyokuScalarConfig>,
+    ) -> Self {
         let max_active = feature_set.max_active();
+        let scalar_len = if nyugyoku_scalar.is_some() {
+            batch_size * NYUGYOKU_SCALAR_DIMS
+        } else {
+            0
+        };
         Self {
             batch_size,
             feature_set,
@@ -594,8 +622,18 @@ impl Batch {
             score: vec![0.0; batch_size],
             wdl: vec![0.0; batch_size],
             per_pos_norm: vec![1.0; batch_size],
+            nyugyoku_scalar,
+            nyugyoku_scalars: vec![0; scalar_len],
             n_positions: 0,
         }
+    }
+
+    /// position `bi` の入玉スカラー (`NYUGYOKU_SCALAR_DIMS` 個)。スカラー無しの batch
+    /// では `None`。`bi < n_positions` を caller が保証する。
+    pub fn nyugyoku_scalar_row(&self, bi: usize) -> Option<&[u8]> {
+        self.nyugyoku_scalar?;
+        let start = bi * NYUGYOKU_SCALAR_DIMS;
+        Some(&self.nyugyoku_scalars[start..start + NYUGYOKU_SCALAR_DIMS])
     }
 
     /// 既存 `Batch` を再利用 (alloc 削減)。`n_positions` を 0 に戻すだけの O(1) 操作。
@@ -659,6 +697,18 @@ impl Batch {
         if self.n_positions >= self.batch_size {
             return Ok(false);
         }
+        // 入玉スカラーは両玉の位置を使う。PSV / HCPE の正常な record では常に両玉が
+        // あるので、欠けていれば壊れた record として学習を止める。特徴抽出より前に
+        // 判定し、batch の buffer を書き換えない。
+        if self.nyugyoku_scalar.is_some()
+            && (!board.black_king_sq.is_valid() || !board.white_king_sq.is_valid())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entering-king scalars need both kings on the board, \
+                 but the decoded position lacks one",
+            ));
+        }
 
         let bi = self.n_positions;
         let row_off = bi * self.max_active;
@@ -680,6 +730,14 @@ impl Batch {
                     spec.canonical_name(),
                 ),
             ));
+        }
+        if let Some(config) = self.nyugyoku_scalar {
+            let start = bi * NYUGYOKU_SCALAR_DIMS;
+            write_nyugyoku_scalars(
+                board,
+                config,
+                &mut self.nyugyoku_scalars[start..start + NYUGYOKU_SCALAR_DIMS],
+            );
         }
         // overflow 済み後なので `written <= max_active`、bin index は必ず範囲内。
         if let Some(hist) = active_hist {
@@ -1505,6 +1563,7 @@ impl BucketedPrefetchedLoader {
             0,
             false,
             0,
+            None,
         )
     }
 
@@ -1526,6 +1585,7 @@ impl BucketedPrefetchedLoader {
         teacher_shuffle_buffer_mib: usize,
         teacher_shuffle: bool,
         teacher_shuffle_seed: u64,
+        nyugyoku_scalar: Option<NyugyokuScalarConfig>,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
@@ -1558,6 +1618,7 @@ impl BucketedPrefetchedLoader {
             compute_bucket,
             num_buckets,
             monitor_active,
+            nyugyoku_scalar,
             reader,
             path,
         ))
@@ -1574,6 +1635,7 @@ impl BucketedPrefetchedLoader {
         compute_bucket: bool,
         num_buckets: usize,
         monitor_active: bool,
+        nyugyoku_scalar: Option<NyugyokuScalarConfig>,
         reader: TrainingPsvReader,
         data_path: &Path,
     ) -> Self {
@@ -1600,7 +1662,7 @@ impl BucketedPrefetchedLoader {
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
-                Batch::with_capacity(batch_size, feature_set),
+                Batch::with_capacity_and_nyugyoku_scalars(batch_size, feature_set, nyugyoku_scalar),
                 Vec::with_capacity(batch_size),
             );
             pool_tx
@@ -1866,6 +1928,10 @@ mod hcpe_tests;
 #[cfg(test)]
 #[path = "dataloader_batch_layout_tests.rs"]
 mod batch_layout_tests;
+
+#[cfg(test)]
+#[path = "dataloader_nyugyoku_scalar_tests.rs"]
+mod nyugyoku_scalar_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2995,6 +3061,7 @@ mod tests {
             0,
             false,
             0,
+            None,
         )
         .unwrap();
         let mut inline = BucketedPrefetchedLoader::spawn_with_score_sources(
@@ -3013,6 +3080,7 @@ mod tests {
             0,
             false,
             0,
+            None,
         )
         .unwrap();
 
@@ -3196,6 +3264,7 @@ mod tests {
             0,
             false,
             0,
+            None,
         )
         .expect("spawn multi-worker dual-label loader");
         let mut error = None;

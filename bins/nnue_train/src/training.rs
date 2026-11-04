@@ -1084,6 +1084,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         num_buckets: layerstack.num_buckets,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
         monitor_active_features: cli.monitor_active_features,
+        nyugyoku_scalar: None,
     };
 
     // forward 用 FT weight (`--ft-fp16` の mirror / factorizer の comb) を学習
@@ -1195,6 +1196,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     cfg.feature_set,
                     cfg.num_buckets,
                     cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                    cfg.nyugyoku_scalar,
                 )?
             }
             _ => {
@@ -2535,6 +2537,7 @@ pub(crate) fn run_simple_training(
         num_buckets: 1,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
         monitor_active_features: cli.monitor_active_features,
+        nyugyoku_scalar: None,
     };
 
     let mut experiment = build_experiment_logger_simple(

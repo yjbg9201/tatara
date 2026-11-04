@@ -266,3 +266,55 @@ BonaPiece、ハッシュ `0xA20DCB9B`) が既にある。仕様書の「A2」と
 | 3 | 入玉ルールの扱い (D8) | ネット側に固定 (27点法)。ルール種別をハッシュと arch 文字列に含め、エンジンの `EnteringKingRule` と食い違う場合は警告を出す (export・推論の段階で実装) |
 | 4 | 駒落ち (`EKR_27_POINT_H`) | 扱わない |
 | 5 | 「宣言条件の成立」ビット | 手番・王手・持ち時間を除いた条件で判定する |
+
+## 7. 段階3: `Batch` 上の入玉スカラーの型とメモリ配置
+
+### 決定
+
+- `Batch` に `nyugyoku_scalar: Option<NyugyokuScalarConfig>` と `nyugyoku_scalars: Vec<u8>` を
+  足す。スカラーは **u8 (0〜127) のまま**持ち、f32 には変換しない。
+- 配置は `[batch_size, 96]` の row-major (`bi * 96 + k`)、1 局面 96 バイト連続。パディングは
+  入れない (96 は 32 の倍数)。
+- `nyugyoku_scalar` が `None` の構成では buffer を確保せず (`Vec` は容量 0)、
+  `push_decoded` もスカラーを計算しない。`[n_positions, batch_size)` の行や `reset` の扱いは
+  既存 buffer と同じ契約 (`n_positions` までしか読まない) に揃える。
+- 設定は `TrainingConfig::nyugyoku_scalar` から学習 loader (`BucketedPrefetchedLoader`) と
+  held-out 検証集合 (`HeldoutSet`) に渡す。CLI はまだ無く、常に `None`
+  (`SimpleId` の密入力種別と一緒に段階5で入れる)。rescore と単一 worker の
+  `PrefetchedLoader` は対象外 (スカラー付きネットの推論を使う段階で必要なら足す)。
+- スカラー有効時に玉が欠けた局面は `InvalidData` で学習を止める。判定は特徴抽出の前に行い、
+  batch の buffer を書き換えない。
+
+### 理由
+
+| 観点 | u8 で持つ場合 | f32 で持つ場合 |
+|---|---|---|
+| H2D 転送量 (1 局面) | 96 B | 384 B |
+| 既存の H2D (HalfKP: stm/nstm index 38 × 4 B × 2 + score/wdl/nnz) | 約 316 B に対し +30% | +122% |
+| 段階5 (量子化 CPU forward・integer-exact 突合) | エンジンの L1 入力 (`uint8_t`) と同じ値をそのまま使える | u8 に戻す必要がある |
+| 段階4 (GPU) | `combined` の列 `[2*ft_out, 2*ft_out+96)` へ書くカーネルで `u8 / 127` に変換する。変換はスカラー列の書き込みと同じカーネルで済む | 変換不要だが転送が 4 倍 |
+| float の参照実装 (CPU) | 行ごとに `u8 / 127` にすればよい (`nyugyoku_scalars_f32` と同じ値) | そのまま使える |
+
+- 学習とエンジンで同じ値を見るため、スカラーは量子化済みの u8 が正 (D5)。f32 はその派生でしかない。
+- row-major の 96 バイト連続にしておくと、段階4では `InputUploadRing` に u8 の pinned buffer を
+  1 組足して 1 回の H2D で送れ、GPU 側は `b × 96` の 2D 配列として読める。
+
+### スループットの計測
+
+`crates/nnue-train/examples/dataloader_throughput.rs` で計測した (sample.psv の 100 局面を
+2,000 回繰り返した 20 万局面の PSV、HalfKP、batch 16,384、各 7 回の中央値)。計測環境は
+クラウドの 4 vCPU (Intel Xeon 2.1 GHz) で、同じ構成でも run 間で ±10% 程度ぶれる。
+
+| 経路 | スカラーなし | スカラーあり (27点法・thermometer) | 変化 |
+|---|---|---|---|
+| 学習 loader、4 worker | 2.49 M pos/s | 2.36 M pos/s | -5.2% |
+| 学習 loader、1 worker | 637 k pos/s | 589 k pos/s | -7.5% |
+| `push_decoded` のみ (1 thread、decode 済み局面) | 3.38 M pos/s | 2.46 M pos/s | -27% |
+| 同上、HalfKA_hm (merged) | 3.69 M pos/s | 2.84 M pos/s | -23% |
+
+- 最初の素直な実装 (マスごとに分岐し、色で添字を引く配列に累積) では学習 loader が
+  -11〜-13% だった。盤面走査を「(駒種, 色) → 寄与」と「マス → 敵陣 field の mask」の表引きで
+  1 つの u64 に累積する形に、thermometer を表のコピーにして、1 局面あたりのスカラー計算を
+  約 220 ns から約 80 ns に減らした。
+- 学習 loader 全体では decode と I/O の比重が大きいので低下は 5〜8%。GPU 学習では loader の
+  worker 数を増やせば吸収できる範囲と見ている (実際の学習速度への影響は段階4で GPU を使って確認する)。

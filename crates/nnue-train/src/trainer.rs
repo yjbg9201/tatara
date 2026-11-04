@@ -58,9 +58,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::{FeatureSetSpec, NyugyokuScalarConfig};
 
 use crate::dataloader::{
     Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, ScoreSource, TeacherFormat,
@@ -508,6 +508,10 @@ pub struct TrainingConfig {
     /// histogram に対して計算する。`false` では histogram を確保せず worker の
     /// ホットパスに計装コードを通さない (feature-set 非依存、threat off でも動く)。
     pub monitor_active_features: bool,
+    /// `Some` のとき dataloader が各 position の入玉スカラー (u8 96 次元) を計算して
+    /// `Batch::nyugyoku_scalars` に詰める (学習 loader と held-out 検証集合の両方)。
+    /// `None` では確保も計算もしない。
+    pub nyugyoku_scalar: Option<NyugyokuScalarConfig>,
 }
 
 impl TrainingConfig {
@@ -854,6 +858,7 @@ where
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
+        cfg.nyugyoku_scalar,
     )?;
 
     let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
@@ -889,8 +894,10 @@ where
     // 指定は reject 済みなので exhaustive な 4-arm match で意図を明示。
     let heldout = match (&cfg.test_data, cfg.test_tail_positions) {
         (Some(test_path), None) => {
-            let set = crate::validation::HeldoutSet::load(
+            let set = crate::validation::HeldoutSet::load_from_range_with_score_sources(
                 test_path,
+                0,
+                std::fs::metadata(test_path)?.len(),
                 cfg.batch_size,
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
@@ -898,6 +905,8 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
+                None,
+                cfg.nyugyoku_scalar,
             )?;
             println!(
                 "[train] held-out validation (external file): data={} | {} batches x bs {} ({} positions)",
@@ -921,6 +930,7 @@ where
                 cfg.feature_set,
                 cfg.num_buckets,
                 cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                cfg.nyugyoku_scalar,
             )?;
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
@@ -1578,6 +1588,7 @@ mod tests {
             num_buckets: 9,
             monitor_fp16_clamps: false,
             monitor_active_features: false,
+            nyugyoku_scalar: None,
         }
     }
 

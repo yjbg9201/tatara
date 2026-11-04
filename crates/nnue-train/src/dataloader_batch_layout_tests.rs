@@ -51,8 +51,11 @@ impl Fnv64 {
     }
 }
 
-/// スカラー導入前から `Batch` にある全 field を畳む。
+/// スカラー導入前から `Batch` にある全 field を畳む。入玉スカラーを使わない構成なので、
+/// スカラーの buffer が確保されていないことも確認する。
 fn digest_batch(h: &mut Fnv64, batch: &Batch) {
+    assert!(batch.nyugyoku_scalar.is_none());
+    assert_eq!(batch.nyugyoku_scalars.capacity(), 0);
     h.usize(batch.batch_size);
     h.bytes(batch.feature_set.canonical_name().as_bytes());
     h.usize(batch.feature_set.ft_in());

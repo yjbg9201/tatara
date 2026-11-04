@@ -148,12 +148,69 @@ impl KingDeclarationState {
     }
 }
 
-/// 駒の宣言点数。角・飛と馬・竜は 5 点、それ以外は 1 点 (玉は呼び出し側で除外する)。
-const fn piece_points(pt: PieceType) -> u8 {
+/// 駒の宣言点数。角・飛と馬・竜は 5 点、それ以外の駒は 1 点。空マスと玉は 0 点
+/// (盤面走査で数えない)。
+const fn piece_points(pt: PieceType) -> u64 {
     match pt {
+        PieceType::None | PieceType::King => 0,
         PieceType::Bishop | PieceType::Rook | PieceType::Horse | PieceType::Dragon => 5,
         _ => 1,
     }
+}
+
+// 盤面走査の累積値を 1 つの u64 に 10 bit ずつ詰める field の位置。盤上の駒は高々 81 枚・
+// 点数は高々 405 点なので 10 bit に収まり、隣の field へ桁あふれしない。
+const FIELD_BITS: u32 = 10;
+const FIELD_MASK: u64 = (1 << FIELD_BITS) - 1;
+const BOARD_POINTS_SHIFT: [u32; 2] = [0, 10];
+const CAMP_PIECES_SHIFT: [u32; 2] = [20, 30];
+const CAMP_POINTS_SHIFT: [u32; 2] = [40, 50];
+
+/// `[駒種 * 2 + 色]` → その駒 1 枚が各 field に足す量 (盤上の点数、敵陣にいる場合の
+/// 枚数 1 と点数)。敵陣の field は [`SQUARE_FIELD_MASK`] でマスごとに選ぶ。
+const PIECE_CONTRIBUTION: [u64; 30] = {
+    let mut t = [0u64; 30];
+    let mut pt = 0;
+    while pt < 15 {
+        let points = piece_points(PieceType::from_u8(pt as u8));
+        let occupied = if points != 0 { 1 } else { 0 };
+        let mut c = 0;
+        while c < 2 {
+            t[pt * 2 + c] = (points << BOARD_POINTS_SHIFT[c])
+                | (occupied << CAMP_PIECES_SHIFT[c])
+                | (points << CAMP_POINTS_SHIFT[c]);
+            c += 1;
+        }
+        pt += 1;
+    }
+    t
+};
+
+/// `[マス]` → 盤上の点数の field と、そのマスを敵陣とする色の敵陣 field を残す mask。
+const SQUARE_FIELD_MASK: [u64; 81] = {
+    let mut t = [0u64; 81];
+    let mut i = 0;
+    while i < 81 {
+        let sq = Square::from_index(i);
+        let mut mask =
+            (FIELD_MASK << BOARD_POINTS_SHIFT[0]) | (FIELD_MASK << BOARD_POINTS_SHIFT[1]);
+        let mut c = 0;
+        while c < 2 {
+            let color = if c == 0 { Color::Black } else { Color::White };
+            if in_enemy_camp(sq, color) {
+                mask |= (FIELD_MASK << CAMP_PIECES_SHIFT[c]) | (FIELD_MASK << CAMP_POINTS_SHIFT[c]);
+            }
+            c += 1;
+        }
+        t[i] = mask;
+        i += 1;
+    }
+    t
+};
+
+const fn field(acc: u64, shift: u32) -> u8 {
+    let v = (acc >> shift) & FIELD_MASK;
+    if v > u8::MAX as u64 { u8::MAX } else { v as u8 }
 }
 
 fn hand_points(hand: &Hand) -> u8 {
@@ -178,53 +235,58 @@ const fn in_enemy_camp(sq: Square, owner: Color) -> bool {
     advance_of(sq, owner) >= 6
 }
 
+/// 両玉の入玉宣言の状態を、盤面を 1 回走査して求める。戻り値は `[先手の玉, 後手の玉]`。
+///
+/// # Panics
+/// 両玉のどちらかが盤上にない場合。
+pub fn king_declaration_states(
+    board: &ShogiBoard,
+    rule: DeclarationRule,
+) -> [KingDeclarationState; 2] {
+    assert!(
+        board.black_king_sq.is_valid() && board.white_king_sq.is_valid(),
+        "entering-king scalars need both kings on the board"
+    );
+    // 1 マスにつき表引き 2 回・AND・加算 1 回で、両色の盤上点数・敵陣の枚数と点数を
+    // まとめて数える (空マス・玉の寄与は 0)。
+    let mut acc = 0u64;
+    for (index, piece) in board.board.iter().enumerate() {
+        let key = piece.piece_type as usize * 2 + piece.color as usize;
+        acc += PIECE_CONTRIBUTION[key] & SQUARE_FIELD_MASK[index];
+    }
+    // 合法な局面では 54 点以下だが、それを超える入力でも u8 で壊れないよう飽和させる。
+    let pieces_in_camp = CAMP_PIECES_SHIFT.map(|shift| field(acc, shift));
+    let camp_points = CAMP_POINTS_SHIFT.map(|shift| field(acc, shift));
+    let board_points = BOARD_POINTS_SHIFT.map(|shift| field(acc, shift));
+    [Color::Black, Color::White].map(|owner| {
+        let c = owner as usize;
+        let (king_sq, hand) = match owner {
+            Color::Black => (board.black_king_sq, &board.black_hand),
+            Color::White => (board.white_king_sq, &board.white_hand),
+        };
+        let hand_points = hand_points(hand);
+        KingDeclarationState {
+            advance: advance_of(king_sq, owner),
+            king_in_enemy_camp: in_enemy_camp(king_sq, owner),
+            pieces_in_camp: pieces_in_camp[c],
+            declaration_points: camp_points[c].saturating_add(hand_points),
+            potential_points: board_points[c].saturating_add(hand_points),
+            hand_points,
+            required_points: rule.required_points(owner),
+        }
+    })
+}
+
 /// `board` の `owner` の玉について入玉宣言の状態を求める。
 ///
 /// # Panics
-/// `owner` の玉が盤上にない場合。
+/// 両玉のどちらかが盤上にない場合。
 pub fn king_declaration_state(
     board: &ShogiBoard,
     owner: Color,
     rule: DeclarationRule,
 ) -> KingDeclarationState {
-    let king_sq = match owner {
-        Color::Black => board.black_king_sq,
-        Color::White => board.white_king_sq,
-    };
-    assert!(
-        king_sq.is_valid(),
-        "entering-king scalars need both kings on the board"
-    );
-    let hand = match owner {
-        Color::Black => &board.black_hand,
-        Color::White => &board.white_hand,
-    };
-
-    let mut pieces_in_camp = 0u8;
-    let mut camp_points = 0u8;
-    let mut board_points = 0u8;
-    for (index, piece) in board.board.iter().enumerate() {
-        if piece.is_none() || piece.color != owner || piece.piece_type == PieceType::King {
-            continue;
-        }
-        let points = piece_points(piece.piece_type);
-        board_points += points;
-        if in_enemy_camp(Square::from_index(index), owner) {
-            pieces_in_camp += 1;
-            camp_points += points;
-        }
-    }
-    let hand_points = hand_points(hand);
-
-    KingDeclarationState {
-        advance: advance_of(king_sq, owner),
-        king_in_enemy_camp: in_enemy_camp(king_sq, owner),
-        pieces_in_camp,
-        declaration_points: camp_points + hand_points,
-        potential_points: board_points + hand_points,
-        hand_points,
-        required_points: rule.required_points(owner),
-    }
+    king_declaration_states(board, rule)[owner as usize]
 }
 
 /// `round(127 * num / den)` (四捨五入は 0.5 を切り上げ)。`num <= den` かつ `den > 0` を
@@ -233,6 +295,58 @@ const fn scale_to_u8(num: u8, den: u8) -> u8 {
     let num = num as u32;
     let den = den as u32;
     ((254 * num + den) / (2 * den)) as u8
+}
+
+/// `[d]` → 前進段数 `d` の thermometer (`d >= 1` … `d >= 8`)。
+const ADVANCE_THERMOMETER: [[u8; 8]; 9] = {
+    let mut t = [[0u8; 8]; 9];
+    let mut d = 0;
+    while d < 9 {
+        let mut k = 0;
+        while k < 8 {
+            t[d][k] = flag(d > k);
+            k += 1;
+        }
+        d += 1;
+    }
+    t
+};
+
+/// `[min(n, 10)]` → 敵陣内の駒数 `n` の thermometer (`n >= 1` … `n >= 10`)。
+const PIECES_THERMOMETER: [[u8; 10]; 11] = {
+    let mut t = [[0u8; 10]; 11];
+    let mut n = 0;
+    while n < 11 {
+        let mut k = 0;
+        while k < 10 {
+            t[n][k] = flag(n > k);
+            k += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+/// 区切りの最大値より 1 大きい残り点数。これ以上の残りは全区切りで 0 になる。
+const REMAINING_TABLE_LEN: usize = REMAINING_POINT_THRESHOLDS[9] as usize + 2;
+
+/// `[min(r, 最大区切り + 1)]` → 残り点数 `r` の thermometer (`r <= t`)。
+const REMAINING_THERMOMETER: [[u8; 10]; REMAINING_TABLE_LEN] = {
+    let mut t = [[0u8; 10]; REMAINING_TABLE_LEN];
+    let mut r = 0;
+    while r < REMAINING_TABLE_LEN {
+        let mut i = 0;
+        while i < 10 {
+            t[r][i] = flag(r as u8 <= REMAINING_POINT_THRESHOLDS[i]);
+            i += 1;
+        }
+        r += 1;
+    }
+    t
+};
+
+fn remaining_thermometer(remaining: u8) -> [u8; 10] {
+    REMAINING_THERMOMETER[usize::from(remaining).min(REMAINING_TABLE_LEN - 1)]
 }
 
 const fn flag(b: bool) -> u8 {
@@ -280,19 +394,12 @@ fn write_block(
     let hand_ratio = scale_to_u8(state.hand_points.min(need), need);
     match encoding {
         ScalarEncoding::Thermometer => {
-            for k in 1..=8u8 {
-                out[usize::from(k) - 1] = flag(state.advance >= k);
-            }
+            out[0..8].copy_from_slice(&ADVANCE_THERMOMETER[usize::from(state.advance)]);
             out[8] = flag(state.king_in_enemy_camp);
-            for k in 1..=10u8 {
-                out[8 + usize::from(k)] = flag(state.pieces_in_camp >= k);
-            }
-            let remaining = state.remaining_points();
-            let remaining_potential = state.remaining_potential_points();
-            for (i, &t) in REMAINING_POINT_THRESHOLDS.iter().enumerate() {
-                out[19 + i] = flag(remaining <= t);
-                out[29 + i] = flag(remaining_potential <= t);
-            }
+            out[9..19]
+                .copy_from_slice(&PIECES_THERMOMETER[usize::from(state.pieces_in_camp.min(10))]);
+            out[19..29].copy_from_slice(&remaining_thermometer(state.remaining_points()));
+            out[29..39].copy_from_slice(&remaining_thermometer(state.remaining_potential_points()));
             out[39] = hand_ratio;
             out[40] = flag(state.declarable());
             out[41] = flag(owner == Color::Black);
@@ -310,6 +417,22 @@ fn write_block(
     }
 }
 
+/// `board` の入玉スカラーを u8 (0〜127) で `out` に書く (`out` 全体を上書きする)。
+///
+/// # Panics
+/// `out.len() != NYUGYOKU_SCALAR_DIMS`、または両玉のどちらかが盤上にない場合。
+pub fn write_nyugyoku_scalars(board: &ShogiBoard, config: NyugyokuScalarConfig, out: &mut [u8]) {
+    assert_eq!(out.len(), NYUGYOKU_SCALAR_DIMS);
+    let states = king_declaration_states(board, config.rule);
+    let us = board.side_to_move;
+    let (ours, rest) = out.split_at_mut(NYUGYOKU_SCALAR_BLOCK_DIMS);
+    let (theirs, pad) = rest.split_at_mut(NYUGYOKU_SCALAR_BLOCK_DIMS);
+    for (owner, block) in [(us, ours), (us.opponent(), theirs)] {
+        write_block(&states[owner as usize], owner, config.encoding, block);
+    }
+    pad.fill(0);
+}
+
 /// `board` の入玉スカラーを u8 (0〜127) で求める。
 ///
 /// # Panics
@@ -319,13 +442,7 @@ pub fn nyugyoku_scalars(
     config: NyugyokuScalarConfig,
 ) -> [u8; NYUGYOKU_SCALAR_DIMS] {
     let mut out = [0u8; NYUGYOKU_SCALAR_DIMS];
-    let us = board.side_to_move;
-    let (ours, rest) = out.split_at_mut(NYUGYOKU_SCALAR_BLOCK_DIMS);
-    let theirs = &mut rest[..NYUGYOKU_SCALAR_BLOCK_DIMS];
-    for (owner, block) in [(us, ours), (us.opponent(), theirs)] {
-        let state = king_declaration_state(board, owner, config.rule);
-        write_block(&state, owner, config.encoding, block);
-    }
+    write_nyugyoku_scalars(board, config, &mut out);
     out
 }
 

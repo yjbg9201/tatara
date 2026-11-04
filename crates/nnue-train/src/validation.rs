@@ -24,9 +24,9 @@ use std::path::Path;
 
 #[cfg(test)]
 use crate::dataloader::DualLabelMode;
-use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::{FeatureSetSpec, NyugyokuScalarConfig};
 
 use crate::dataloader::{
     Batch, BucketMode, ScoreOverrideReader, ScoreSource, TeacherFileLoader, TeacherFormat,
@@ -97,6 +97,7 @@ impl HeldoutSet {
             feature_set,
             num_buckets,
             None,
+            None,
         )
     }
 
@@ -130,11 +131,13 @@ impl HeldoutSet {
             feature_set,
             num_buckets,
             None,
+            None,
         )
     }
 
     /// PSV / HCPE range を sidecar または dual-label の明示的な score source で読む。
     /// dual-label は PSV だけが持つ field を使うため HCPE では error。
+    /// `nyugyoku_scalar` が `Some` なら各 batch に入玉スカラーも詰める。
     #[allow(clippy::too_many_arguments)]
     pub fn load_from_range_with_score_sources(
         path: &Path,
@@ -148,6 +151,7 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
         score_source: Option<ScoreSource<&Path>>,
+        nyugyoku_scalar: Option<NyugyokuScalarConfig>,
     ) -> io::Result<Self> {
         let format = TeacherFormat::for_path(path)?;
         if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
@@ -187,6 +191,7 @@ impl HeldoutSet {
             bucket_mode,
             feature_set,
             num_buckets,
+            nyugyoku_scalar,
         )
     }
 
@@ -202,13 +207,16 @@ impl HeldoutSet {
         bucket_mode: &(impl Copy + Into<BucketMode>),
         feature_set: FeatureSetSpec,
         num_buckets: usize,
+        nyugyoku_scalar: Option<NyugyokuScalarConfig>,
     ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let bucket_mode = (*bucket_mode).into();
         let n_batches = test_positions.div_ceil(batch_size).max(1);
         let mut batches: Vec<(Batch, Vec<i32>)> = Vec::with_capacity(n_batches);
-        let mut cur = Batch::with_capacity(batch_size, feature_set);
+        let new_batch =
+            || Batch::with_capacity_and_nyugyoku_scalars(batch_size, feature_set, nyugyoku_scalar);
+        let mut cur = new_batch();
         let mut cur_buckets: Vec<i32> = Vec::with_capacity(batch_size);
 
         while batches.len() < n_batches {
@@ -231,8 +239,7 @@ impl HeldoutSet {
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
             cur_buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
             if cur.n_positions == batch_size {
-                let full =
-                    std::mem::replace(&mut cur, Batch::with_capacity(batch_size, feature_set));
+                let full = std::mem::replace(&mut cur, new_batch());
                 let full_buckets = std::mem::take(&mut cur_buckets);
                 batches.push((full, full_buckets));
             }
@@ -572,6 +579,7 @@ mod tests {
             test_spec(),
             9,
             Some(ScoreSource::DualLabel(DualLabelMode::Gated)),
+            None,
         )
         .expect("load dual-label tail held-out set");
         let scores = &set.batches[0].0.score[..8];
@@ -711,6 +719,7 @@ mod tests {
                     scores: scores.as_path(),
                     mask: None,
                 }),
+                None,
             )
             .expect("load tail range with sidecar")
         };
