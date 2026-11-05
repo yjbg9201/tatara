@@ -307,9 +307,10 @@ NyugyokuScalar[96]（手番順、u8 0〜127）──┐
    - T: スカラー列は int8（`round(x*127)`）。L1重みの列順は「FT列 → スカラー列」、パディングは32の倍数。`--scale 508` 前提（§3）
    - T・Y: 新ハッシュ値（符号化種別・ルール種別を含める）を採番し、byte-golden テストで出力バイト列を固定
    - Y: forward 直前にスカラー96次元を構築して L1 入力末尾に連結。L1 入力次元を 512→608 に拡張。ビルドフラグ（例: `NNUE_ARCHITECTURE_HALFKP_NYUGYOKU`）で既存アーキと切り替え
+     - 実装（段階5b）: 評価関数ファイル上の L1 は 608 入力のまま、推論では96次元を作らず、読み込み時に作る「玉の状態 → L1 への寄与」の表を引いて足す（integer-exact は不変）。玉の状態は直前の手で変わり得ない玉について親局面から引き継ぐ。NPS 低下は同じ探索木で約4%
    - Y: **新アーキのビルドではハッシュ不一致をエラーにする**（従来 NNUE は警告のみ。§1.1）
    - Y: ネットのルール種別とエンジンの `EnteringKingRule` が食い違う場合はロード時に警告する
-   - 結果（integer-exact 突合・NPS・改善案）は tatara `docs/adr-nyugyoku-scalar-input.md` §8
+   - 結果（integer-exact 突合・NPS・改善案）は tatara `docs/adr-nyugyoku-scalar-input.md` §8、NPS 低下への対策（段階5b）は §9
    - T: **Simple 用の量子化 CPU forward を追加する**（FT i16 累積 → u8 化 → i8 アフィン `>> 6` …とエンジンと同じ整数演算）。GPU なしで integer-exact 突合を行うのに使う
 6. **検証**
    - §1.2 の4段階。まずランダム1万局面で T と Y のスカラー値（int8化後）を突合し、その後 integer-exact（T の量子化 forward と Y の `Evaluate()` が±0で一致）
