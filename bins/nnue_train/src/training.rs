@@ -1538,6 +1538,41 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
 /// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は CLI override、
 /// 読み込んだ net / checkpoint、`--scale` からの導出の順で決まる。override 未指定時は
 /// 読み込み元の有無にかかわらず両 scale の一致を必須とする。
+/// `simple --nyugyoku-rule` / `--nyugyoku-encoding` を入玉スカラーの設定に解釈する。
+/// 指定なしは `None`。密入力は CReLU のみ対応。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn simple_nyugyoku_scalar(
+    simple_args: &SimpleArgs,
+    activation: nnue_format::SimpleActivation,
+) -> Result<Option<shogi_features::NyugyokuScalarConfig>, String> {
+    use shogi_features::{DeclarationRule, NyugyokuScalarConfig, ScalarEncoding};
+    let Some(rule_name) = &simple_args.nyugyoku_rule else {
+        if simple_args.nyugyoku_encoding.is_some() {
+            return Err("--nyugyoku-encoding requires --nyugyoku-rule".to_string());
+        }
+        return Ok(None);
+    };
+    let rule = DeclarationRule::from_canonical_name(rule_name).ok_or_else(|| {
+        format!("--nyugyoku-rule '{rule_name}' is not supported (expected one of: csa27, csa24)")
+    })?;
+    let encoding = match &simple_args.nyugyoku_encoding {
+        None => ScalarEncoding::Thermometer,
+        Some(name) => ScalarEncoding::from_canonical_name(name).ok_or_else(|| {
+            format!(
+                "--nyugyoku-encoding '{name}' is not supported (expected one of: thermometer, \
+                 onehot)"
+            )
+        })?,
+    };
+    if activation != nnue_format::SimpleActivation::CReLU {
+        return Err(format!(
+            "--nyugyoku-rule requires --activation crelu (got {})",
+            activation.canonical_name()
+        ));
+    }
+    Ok(Some(NyugyokuScalarConfig { rule, encoding }))
+}
+
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
@@ -2351,13 +2386,22 @@ pub(crate) fn run_simple_training(
     } else {
         feature_set
     };
+    let nyugyoku_scalar = simple_nyugyoku_scalar(simple_args, activation)?;
+    if nyugyoku_scalar.is_some() {
+        // L1 入力に密入力の列を足す GPU 経路 (FT post カーネルの行幅など) は未実装。
+        return Err(
+            "--nyugyoku-rule: training a net with entering-king scalar inputs on the GPU is not \
+             supported yet"
+                .into(),
+        );
+    }
     let id = SimpleId {
         feature_set,
         activation,
         ft_out,
         l1_out,
         l2_out,
-        nyugyoku_scalar: None,
+        nyugyoku_scalar,
     };
 
     // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
@@ -2538,7 +2582,7 @@ pub(crate) fn run_simple_training(
         num_buckets: 1,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
         monitor_active_features: cli.monitor_active_features,
-        nyugyoku_scalar: None,
+        nyugyoku_scalar: id.nyugyoku_scalar,
     };
 
     let mut experiment = build_experiment_logger_simple(

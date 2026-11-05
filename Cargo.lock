@@ -790,6 +790,7 @@ name = "nnue-format"
 version = "0.5.0"
 dependencies = [
  "shogi-features",
+ "shogi-format",
 ]
 
 [[package]]
