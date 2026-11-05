@@ -328,3 +328,108 @@ BonaPiece、ハッシュ `0xA20DCB9B`) が既にある。仕様書の「A2」と
   スカラーなしで動かさず、エラーにする (CLI を入れる段階5で実装)。
 - HCPE 経路は、HCPE エンコーダを作らず「loader が詰めたスカラー」と「同じ record を復号した
   盤面から直接計算したスカラー」の一致で検証する (`hcpe_loader_matches_direct_computation`)。
+
+## 8. 段階5: export と推論、integer-exact 突合
+
+### 実装
+
+- tatara
+  - `SimpleId::nyugyoku_scalar` (`Option<NyugyokuScalarConfig>`)。`Some` のとき `combined_dim()` は
+    FT 出力の連結＋96 (HalfKP 256x2 で 608)、`ft_output_dim()` が FT 部分。CReLU のみ。
+  - hash: L1 入力層の hash `0xEC42E90D ^ l1_input` に、トークン
+    `NyugyokuScalar(<rule>,<encoding>)[96]` の FNV-1a 32bit を XOR する (`fc_hash`)。arch 文字列の
+    入力層は `InputSlice[608(0:512)+NyugyokuScalar(csa27,thermometer)[96](512:608)]`。
+    密入力なしの構成の hash・arch 文字列・保存バイト列は変更前に固定したテストどおり不変。
+  - `SimpleQuantised`: `.bin` を整数のまま読み (header 検査は `SimpleWeights::load` と共通)、
+    YaneuraOu の従来 NNUE と同じ整数演算で forward する。
+  - CLI: `simple --nyugyoku-rule csa27|csa24 [--nyugyoku-encoding thermometer|onehot]`。GPU で
+    学習する経路は段階4なので、指定すると CUDA 初期化の前にエラーにする。
+  - `examples/simple_quantised_eval`: 乱数ネットの書き出しと SFEN の評価 (`--stats` で層ごとの
+    飽和率)。
+- YaneuraOu
+  - edition `YANEURAOU_ENGINE_NNUE_HALFKP_NYUGYOKU_256X2_32_32`、`NYUGYOKU_RULE` /
+    `NYUGYOKU_ENCODING` でネットのルール・符号化を選ぶ。
+  - 入力層 `NyugyokuScalarInputSlice` が L1 入力次元・hash・構造文字列を定め、
+    `TransformInput()` が FT 出力の直後に入玉スカラーを書く。
+  - 新アーキのビルドではハッシュ不一致を `FileMismatch` にする。ネットのルールとエンジンの
+    `EnteringKingRule` が違うと `isready` で警告する。
+  - スカラー計算は段階2の bitboard 実装 (popcount、81 マス走査なし) のまま。
+
+### integer-exact 突合
+
+局面: YaneuraOu の `test nn gen_sfens` による平手からのランダムプレイアウト 10,000 局面
+(40% の対局は手番側の玉を前に進める手を優先) ＋ golden 8 局面。玉が敵陣にいる局面 3,346
+(うち相入玉 2,263)、宣言条件を満たす玉がある局面 6。
+
+| ネット | ルール・符号化 | スカラー列の weight | エンジン | 一致 (駒が揃った 10,006 局面) |
+|---|---|---|---|---|
+| A | csa27・thermometer | ±127 | 新アーキ (csa27) | 10,006 / 10,006 |
+| B | csa27・thermometer | ±8 (線形域) | 新アーキ (csa27) | 10,006 / 10,006 |
+| C | csa24・one-hot | ±127 | 新アーキ (csa24・onehot) | 10,006 / 10,006 |
+| D | 入玉スカラーなし | – | 従来 HalfKP | 10,006 / 10,006 |
+
+- 出力層の生の値・評価値の両方を比較した。A では hidden1 の 53% が 0、44% が 127 に張り付き、
+  飽和・クリップの経路を通っている。B は線形域を多く通す構成。
+- 駒の欠けた golden 2 局面 (`both_entered`、`black_entered`) は B・C・D で値がずれた。原因は
+  下記の HalfKP の既存の差異で、YaneuraOu 側の挙動を tatara で再現すると 5 件すべて一致した
+  (入玉スカラーの部分は一致している)。
+- 新アーキは別ルール・別符号化のネットと従来 HalfKP のネットを読み込み時にエラーにすることを
+  確認した (従来 HalfKP のビルドは従来どおり警告のみ)。
+
+### 既存の差異 (段階5とは無関係、未修正)
+
+- **HalfKP の駒の欠け**: YaneuraOu の `HalfKP::AppendActiveIndices` は常に 38 個の index を出し、
+  盤上・手駒に無い駒は `BONA_PIECE_ZERO` (index `玉マス * fe_end`) として数える。tatara の
+  `extract_active_features` は存在する駒だけを出す。駒落ちや駒箱のある局面でだけ FT が
+  食い違い、平手の対局から作った教師データ (常に 40 枚) には影響しない。直すなら tatara 側で
+  欠けた駒の分の index を出すか、駒の欠けた局面を教師から除く。
+- YaneuraOu (従来 HalfKP のビルドでも) は駒の欠けた手作りの局面 (`black_entered`) の探索中に
+  segfault した。NPS の計測局面から駒の欠けた局面は除いた。
+- YaneuraOu の NNUE ビルドの `unittest` と `test nn ...` は、`isready` の前に打つと評価関数が
+  未読み込みのため segfault する。
+
+### NPS
+
+`bench 64 1 1000 <局面> movetime` (1 thread、乱数ネット)、局面はプレイアウトの 40 局面＋駒の
+揃った golden 6 局面、各 3 回。計測環境は 4 vCPU Intel Xeon 2.1 GHz。
+
+| エンジン | run 1 | run 2 | run 3 | 中央値 |
+|---|---|---|---|---|
+| 従来 HalfKP 256x2-32-32 | 966,590 | 931,607 | 950,383 | 950,383 |
+| 新アーキ (入玉スカラー) | 833,816 | 810,265 | 813,122 | 813,122 |
+
+**NPS は -14.4%** で、5% を超える。乱数ネット同士では探索木の形も変わるので、評価関数だけの
+時間 (`test nn bench_eval`、プレイアウト 10,000 局面の合法手ごとに do_move → evaluate →
+undo_move、3 回の中央値) でも比べた。
+
+| エンジン | 評価 1 回 (差分更新つき) |
+|---|---|
+| 従来 HalfKP | 477 ns |
+| 新アーキでスカラーを 0 で埋めた計測用ビルド (L1 608 のみ) | 496 ns (+4%) |
+| 新アーキ | 563 ns (+18%) |
+
+スカラー計算 1 回 (両玉・96 次元、`test nn bench_scalar`) は約 64 ns。
+
+### 原因
+
+1. **スカラー計算** (増分の約 8 割、約 65 ns/評価): 評価のたびに両玉の状態 (popcount 約 8 回と
+   持ち駒点数) を求め、44 次元のブロックを 2 つ書く。差分更新が無い。
+2. **L1 の入力幅** (約 2 割、約 19 ns): sparse 入力の affine は 0 でない 4 バイト単位ごとに
+   32 出力の積和をするので、スカラー 96 個 (約 37% が 0 でない) の分だけ仕事が増える。
+
+### 改善案 (未実装、hs の判断待ち)
+
+- **A. スカラーの L1 への寄与を表引きにする (本命)**: 各ブロックは玉ごとの小さな整数
+  (前進段数 0〜8、敵陣内の駒数 0〜10、残り点数 0〜29 ×2、持ち駒比率 0〜必要点、フラグ 3 つ)
+  だけで決まる。ネット読み込み時に「値 → L1 の 32 出力への寄与 (i32)」の表を部分ブロックごとに
+  作れば、スカラー部分の L1 は 1 玉あたり 8 回程度の 32 要素ベクトル加算で済み、スカラーの
+  書き出しと sparse affine のスカラー部分が無くなる。表は 1 玉あたり約 120 項目 × 32 × 4 B ≈
+  15 KB (両玉で約 30 KB)。L1 の積和は ClippedReLU の前の整数の和なので、加算の順序を変えても
+  結果は変わらず integer-exact を保てる。見込みはスカラー＋L1 スカラー部分が約 85 ns → 10〜20 ns、
+  NPS の低下は数 % 程度 (未計測の見積り)。
+- **B. 玉ごとの状態を StateInfo にキャッシュする**: 状態が変わるのは、玉が動く・敵陣に駒が
+  出入りする・持ち駒が変わる手だけなので、それ以外は親局面の値を使う。A と組み合わせられる。
+- **C. 計算そのものの軽量化**: thermometer を表のコピーにし両玉をまとめて求める (tatara 側で
+  220 → 80 ns にした方法)。効果は A より小さい。
+
+推奨は A (必要なら B を追加)。
