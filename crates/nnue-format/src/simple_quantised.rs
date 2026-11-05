@@ -79,6 +79,11 @@ impl SimpleQuantised {
 
     /// `board` の手番側から見た出力層の生の値 (i32)。CReLU の構成のみ対応。
     pub fn forward_raw(&self, board: &ShogiBoard) -> Result<i32, String> {
+        Ok(self.forward_trace(board)?.output)
+    }
+
+    /// [`forward_raw`](Self::forward_raw) と同じ計算で、各層の入力・出力も返す。
+    pub fn forward_trace(&self, board: &ShogiBoard) -> Result<ForwardTrace, String> {
         let id = &self.id;
         if id.activation != SimpleActivation::CReLU {
             return Err(format!(
@@ -120,13 +125,36 @@ impl SimpleQuantised {
 
         let hidden1 = affine_clipped(&input, &self.l1_w, &self.l1_b, id.l1_out);
         let hidden2 = affine_clipped(&hidden1, &self.l2_w, &self.l2_b, id.l2_out);
-        Ok(affine_raw(&hidden2, &self.l3_w, self.l3_b[0]))
+        let output = affine_raw(&hidden2, &self.l3_w, self.l3_b[0]);
+        input.truncate(l1_in);
+        let (mut hidden1, mut hidden2) = (hidden1, hidden2);
+        hidden1.truncate(id.l1_out);
+        hidden2.truncate(id.l2_out);
+        Ok(ForwardTrace {
+            input,
+            hidden1,
+            hidden2,
+            output,
+        })
     }
 
     /// `board` の手番側から見た評価値 (`forward_raw / fv_scale`、0 方向へ切り捨て)。
     pub fn evaluate(&self, board: &ShogiBoard) -> Result<i32, String> {
         Ok(self.forward_raw(board)? / self.fv_scale)
     }
+}
+
+/// 量子化 forward の各層の値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardTrace {
+    /// L1 の入力 (`combined_dim` 個、FT 出力と入玉スカラー)。
+    pub input: Vec<u8>,
+    /// L1 の ClippedReLU 後 (`l1_out` 個)。
+    pub hidden1: Vec<u8>,
+    /// L2 の ClippedReLU 後 (`l2_out` 個)。
+    pub hidden2: Vec<u8>,
+    /// 出力層の生の値。
+    pub output: i32,
 }
 
 /// `input` は `pad32(in_dim)` 長 (padding は 0)。出力も次の層の入力として `pad32(out_dim)` 長。

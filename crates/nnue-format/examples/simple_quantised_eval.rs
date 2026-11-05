@@ -6,7 +6,8 @@
 //!     --out /path/to/nn.bin [--nyugyoku-rule csa27] [--nyugyoku-encoding thermometer] \
 //!     [--seed 1] [--fv-scale 16] [--scalar-weight 127]
 //!
-//! # SFEN 1 行 1 局面のファイルを評価し、「出力層の生の値<TAB>評価値」を 1 行ずつ出す
+//! # SFEN 1 行 1 局面のファイルを評価し、「出力層の生の値<TAB>評価値」を 1 行ずつ出す。
+//! # --stats を付けると、各層で 0 / 127 に張り付いた値の割合を標準エラーに出す
 //! cargo run -p nnue-format --release --example simple_quantised_eval -- eval \
 //!     --net /path/to/nn.bin --sfens /path/to/positions.sfen [--nyugyoku-rule csa27]
 //! ```
@@ -34,6 +35,7 @@ struct Args {
     fv_scale: i32,
     scalar_weight: i64,
     nyugyoku: Option<NyugyokuScalarConfig>,
+    stats: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -50,10 +52,15 @@ fn parse_args() -> Result<Args, String> {
         fv_scale: 16,
         scalar_weight: 127,
         nyugyoku: None,
+        stats: false,
     };
     let mut rule: Option<DeclarationRule> = None;
     let mut encoding = ScalarEncoding::Thermometer;
     while let Some(flag) = it.next() {
+        if flag == "--stats" {
+            args.stats = true;
+            continue;
+        }
         let value = it.next().ok_or(format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--out" => args.out = PathBuf::from(value),
@@ -172,6 +179,7 @@ fn eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let input = BufReader::new(std::fs::File::open(&args.sfens)?);
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
+    let mut stats = Stats::default();
     for line in input.lines() {
         let line = line?;
         let sfen = line.trim();
@@ -180,11 +188,68 @@ fn eval(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         let sfen = sfen.strip_prefix("sfen ").unwrap_or(sfen);
         let board = ShogiBoard::from_sfen(sfen)?;
-        let raw = net.forward_raw(&board)?;
+        let trace = net.forward_trace(&board)?;
+        let raw = trace.output;
         writeln!(out, "{raw}\t{}", raw / net.fv_scale)?;
+        if args.stats {
+            let ft_cols = id.ft_output_dim();
+            stats.add("FT output", &trace.input[..ft_cols]);
+            stats.add("scalars", &trace.input[ft_cols..]);
+            stats.add("hidden1", &trace.hidden1);
+            stats.add("hidden2", &trace.hidden2);
+            stats.positions += 1;
+            stats.declarable += usize::from(
+                args.nyugyoku.is_some()
+                    && (trace.input[ft_cols + 40] != 0 || trace.input[ft_cols + 44 + 40] != 0),
+            );
+        }
     }
     out.flush()?;
+    if args.stats {
+        stats.print(args.nyugyoku);
+    }
     Ok(())
+}
+
+/// 層ごとの (値の数, 0 の数, 127 の数)。
+#[derive(Default)]
+struct Stats {
+    layers: Vec<(&'static str, usize, usize, usize)>,
+    positions: usize,
+    declarable: usize,
+}
+
+impl Stats {
+    fn add(&mut self, name: &'static str, values: &[u8]) {
+        let entry = match self.layers.iter_mut().find(|l| l.0 == name) {
+            Some(e) => e,
+            None => {
+                self.layers.push((name, 0, 0, 0));
+                self.layers.last_mut().unwrap()
+            }
+        };
+        entry.1 += values.len();
+        entry.2 += values.iter().filter(|&&v| v == 0).count();
+        entry.3 += values.iter().filter(|&&v| v == 127).count();
+    }
+
+    fn print(&self, nyugyoku: Option<NyugyokuScalarConfig>) {
+        for (name, n, zero, max) in &self.layers {
+            let pct = |k: &usize| 100.0 * *k as f64 / (*n).max(1) as f64;
+            eprintln!(
+                "{name:>10}: {n} values, 0: {:.1}%, 127: {:.1}%, in between: {:.1}%",
+                pct(zero),
+                pct(max),
+                100.0 - pct(zero) - pct(max)
+            );
+        }
+        if nyugyoku.is_some_and(|c| c.encoding == ScalarEncoding::Thermometer) {
+            eprintln!(
+                "positions with a declarable king (either side): {}/{}",
+                self.declarable, self.positions
+            );
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
