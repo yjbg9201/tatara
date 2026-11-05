@@ -2357,6 +2357,7 @@ pub(crate) fn run_simple_training(
         ft_out,
         l1_out,
         l2_out,
+        nyugyoku_scalar: None,
     };
 
     // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
@@ -2932,6 +2933,7 @@ mod tests {
                 ft_out: 256,
                 l1_out: 32,
                 l2_out: 32,
+                nyugyoku_scalar: None,
             },
             0,
             None,

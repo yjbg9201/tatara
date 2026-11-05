@@ -50,6 +50,7 @@ fn cases() -> Vec<(&'static str, SimpleId)> {
         ft_out,
         l1_out,
         l2_out,
+        nyugyoku_scalar: None,
     };
     vec![
         (

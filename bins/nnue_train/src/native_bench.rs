@@ -513,6 +513,7 @@ fn create_simple_trainer(
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let mut trainer = create_with_backend(backend, || {
         SimpleGpuTrainer::new(

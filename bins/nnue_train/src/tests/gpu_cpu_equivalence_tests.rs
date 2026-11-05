@@ -1060,6 +1060,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 ft_out,
                 l1_out: 32,
                 l2_out: 32,
+                nyugyoku_scalar: None,
             };
             let mut trainer = SimpleGpuTrainer::new(
                 &ctx,
@@ -5989,6 +5990,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
             ft_out,
             l1_out: 32,
             l2_out: 32,
+            nyugyoku_scalar: None,
         };
         // 非 factorize 網の量子化 byte 長 (export 同形の基準)。pairwise は combined_dim が
         // 半減し L1 形状が変わるので活性化ごとに基準を取り直す。
@@ -6105,6 +6107,7 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let fac_id = SimpleId {
         feature_set: base_id.feature_set.with_ft_factorize(),
@@ -6178,6 +6181,7 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         ft_out,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let train_ft_in = fac_spec.train_ft_in();
     let lr = 0.1_f32;
@@ -6270,6 +6274,7 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let lr = 0.1_f32;
     let decay = 0.01_f32;
@@ -6373,6 +6378,7 @@ fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     // smoke_dummy の score=0 / wdl=0.5 は sigmoid loss の最小点に近く勾配が
     // 消えるので、score を動かして学習信号 (非ゼロ grad) を作る。
@@ -6493,6 +6499,7 @@ fn simple_denom_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
     for s in batch.score.iter_mut() {

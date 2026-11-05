@@ -51,6 +51,7 @@ fn standard_id() -> SimpleId {
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     }
 }
 
@@ -2928,6 +2929,7 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
         ft_out: 8,
         l1_out: 8,
         l2_out: 8,
+        nyugyoku_scalar: None,
     };
     let precision = PrecisionFlags {
         ft_fp16: true,

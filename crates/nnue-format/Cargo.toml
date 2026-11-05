@@ -17,3 +17,5 @@ workspace = true
 # artifact identity (arch 文字列 / hash) を feature set から導出するため
 # shogi-features (CPU-only) に依存する。
 shogi-features = { workspace = true }
+# Simple の量子化 CPU forward が局面 (`ShogiBoard`) を受け取るため。
+shogi-format = { workspace = true }
