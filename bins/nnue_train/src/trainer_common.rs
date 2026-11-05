@@ -1,6 +1,7 @@
 use gpu_runtime::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, LaunchConfig};
 use nnue_train::dataloader::Batch;
 use shogi_features::FeatureSetSpec;
+use shogi_features::nyugyoku_scalar::{NYUGYOKU_SCALAR_DIMS, NyugyokuScalarConfig};
 
 use crate::kernel_module::*;
 
@@ -148,6 +149,10 @@ pub(crate) struct BatchData<'a> {
     pub(crate) score: &'a [f32], // (n_pos)、target eval cp の元
     pub(crate) wdl: &'a [f32], // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
     pub(crate) per_pos_norm: f32, // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)
+    /// 入玉スカラーの設定 (`Batch::nyugyoku_scalar` と同じ)。`None` なら `nyugyoku_scalars` は空。
+    pub(crate) nyugyoku_scalar: Option<NyugyokuScalarConfig>,
+    /// 入玉スカラー (n_pos × `NYUGYOKU_SCALAR_DIMS`、u8、127 が 1.0)。
+    pub(crate) nyugyoku_scalars: &'a [u8],
 }
 
 /// `BatchData` を owned 形で組み立てるための一時 buffer (smoke / test 用)。本体 train_step
@@ -160,6 +165,8 @@ pub(crate) struct BatchDataOwned {
     pub(crate) bucket_idx: Vec<i32>,
     pub(crate) score: Vec<f32>,
     pub(crate) wdl: Vec<f32>,
+    pub(crate) nyugyoku_scalar: Option<NyugyokuScalarConfig>,
+    pub(crate) nyugyoku_scalars: Vec<u8>,
 }
 
 impl BatchDataOwned {
@@ -174,7 +181,23 @@ impl BatchDataOwned {
             score: &self.score,
             wdl: &self.wdl,
             per_pos_norm: if n == 0 { 0.0 } else { 1.0_f32 / n as f32 },
+            nyugyoku_scalar: self.nyugyoku_scalar,
+            nyugyoku_scalars: &self.nyugyoku_scalars,
         }
+    }
+
+    /// 入玉スカラーつきの構成 (smoke / test) 用に、決定論的な u8 (`0..=127`) の入玉スカラーを
+    /// 足す。値は局面の盤面と無関係で、kernel の配線と数値の検査にだけ使う。
+    pub(crate) fn with_dummy_nyugyoku_scalars(mut self, config: NyugyokuScalarConfig) -> Self {
+        let mut s: u32 = 0x9e37_79b9;
+        self.nyugyoku_scalars = (0..self.n_pos * NYUGYOKU_SCALAR_DIMS)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 24) % 128) as u8
+            })
+            .collect();
+        self.nyugyoku_scalar = Some(config);
+        self
     }
 }
 
@@ -214,6 +237,8 @@ impl BatchData<'_> {
             bucket_idx: vec![0_i32; n_pos],
             score: vec![0.0_f32; n_pos],
             wdl: vec![0.5_f32; n_pos],
+            nyugyoku_scalar: None,
+            nyugyoku_scalars: Vec::new(),
         }
     }
 
@@ -269,6 +294,12 @@ impl BatchData<'_> {
             score: &batch.score[..n_pos],
             wdl: &batch.wdl[..n_pos],
             per_pos_norm: norm,
+            nyugyoku_scalar: batch.nyugyoku_scalar,
+            nyugyoku_scalars: if batch.nyugyoku_scalar.is_some() {
+                &batch.nyugyoku_scalars[..n_pos * NYUGYOKU_SCALAR_DIMS]
+            } else {
+                &[]
+            },
         }
     }
 }
@@ -587,6 +618,26 @@ pub(crate) fn copy_host_to_device_async_f32(
     );
     let bytes = std::mem::size_of_val(src);
     if bytes == 0 {
+        return Ok(());
+    }
+    // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
+    // 同 context + `src` 生存は caller 保証)。
+    unsafe { gpu_runtime::memcpy_htod_async(buf, src, stream)? };
+    Ok(())
+}
+
+pub(crate) fn copy_host_to_device_async_u8(
+    stream: &CudaStream,
+    buf: &DeviceBuffer<u8>,
+    src: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        src.len() <= buf.len(),
+        "src.len()={} exceeds buf.len()={}",
+        src.len(),
+        buf.len()
+    );
+    if src.is_empty() {
         return Ok(());
     }
     // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
@@ -1042,6 +1093,8 @@ pub(crate) struct InputUploadRing {
     pinned_bucket: Option<[*mut i32; 2]>,
     pinned_score: [*mut f32; 2],
     pinned_wdl: [*mut f32; 2],
+    /// 入玉スカラー (u8、`batch * NYUGYOKU_SCALAR_DIMS`)。入玉スカラーつきの Simple だけが持つ。
+    pinned_nyugyoku: Option<[*mut u8; 2]>,
     /// 各 slot の H2D 完了 event (copy stream に record)。compute stream が forward 前に待つ。
     h2d_done: [CudaEvent; 2],
     /// 各 slot を使った step の compute 完了 event (compute stream に record、
@@ -1056,7 +1109,7 @@ pub(crate) struct InputUploadRing {
     step: usize,
 }
 
-// SAFETY: 非 `Send` な field は raw pointer `pinned_*` のみ。これは `cuMemHostAlloc` で
+// SAFETY: 非 `Send` な field は raw pointer `pinned_*` (`pinned_nyugyoku` を含む) のみ。これは `cuMemHostAlloc` で
 // 確保した page-locked host memory への pointer で、`InputUploadRing` が単独 owner、
 // 全 access は `&mut self` method (`upload` / `mark_step_done`) 経由で直列化される。
 // raw pointer 経由の aliasing も内部からの concurrent access も無いので別 thread へ
@@ -1072,17 +1125,19 @@ impl InputUploadRing {
         batch: usize,
         max_active: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_inner(ctx, batch, max_active, true)
+        Self::new_inner(ctx, batch, max_active, true, false)
     }
 
     /// Simple アーキ用: bucket buffer を確保しないバリアント。Simple は bucket-less 入力
     /// で kernel への bucket dispatch も無いため、bucket H2D 経路自体を持たない。
+    /// `has_nyugyoku` のときだけ入玉スカラーの pinned buffer を確保する。
     pub(crate) fn new_simple(
         ctx: &std::sync::Arc<CudaContext>,
         batch: usize,
         max_active: usize,
+        has_nyugyoku: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_inner(ctx, batch, max_active, false)
+        Self::new_inner(ctx, batch, max_active, false, has_nyugyoku)
     }
 
     pub(crate) fn new_inner(
@@ -1090,6 +1145,7 @@ impl InputUploadRing {
         batch: usize,
         max_active: usize,
         has_bucket: bool,
+        has_nyugyoku: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let copy_stream = ctx.new_stream()?;
         let cap_idx = batch.max(1) * max_active;
@@ -1107,6 +1163,11 @@ impl InputUploadRing {
             pinned_bucket,
             pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
             pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
+            pinned_nyugyoku: if has_nyugyoku {
+                Some(alloc_pinned_host::<u8>(cap_scalar * NYUGYOKU_SCALAR_DIMS)?)
+            } else {
+                None
+            },
             h2d_done: [ctx.new_event(None)?, ctx.new_event(None)?],
             step_done: [ctx.new_event(None)?, ctx.new_event(None)?],
             cap_idx,
@@ -1225,7 +1286,8 @@ impl InputUploadRing {
     }
 
     /// Simple アーキ用 upload: bucket buffer を持たない 5 buffer 版
-    /// (stm/nstm/nnz/score/wdl)。
+    /// (stm/nstm/nnz/score/wdl)。入玉スカラーつきの構成では `nyugyoku` に
+    /// (device buffer, n_pos × `NYUGYOKU_SCALAR_DIMS` の u8) を渡し、同じ slot で送る。
     /// 動作セマンティクスは [`upload`](Self::upload) と同じ — caller が active/back を
     /// `mem::swap` 済の `dev_*` に対し pinned 経由 copy stream で先行 H2D し、compute
     /// stream に H2D 完了を待たせる。
@@ -1243,6 +1305,7 @@ impl InputUploadRing {
         h_score: &[f32],
         dev_wdl: &DeviceBuffer<f32>,
         h_wdl: &[f32],
+        nyugyoku: Option<(&DeviceBuffer<u8>, &[u8])>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             self.pinned_bucket.is_none(),
@@ -1262,6 +1325,19 @@ impl InputUploadRing {
             "input batch (scalar) exceeds pinned capacity {}",
             self.cap_scalar
         );
+        assert_eq!(
+            nyugyoku.is_some(),
+            self.pinned_nyugyoku.is_some(),
+            "entering-king scalar upload must match the ring built by new_simple"
+        );
+        if let Some((_, h_nyugyoku)) = nyugyoku {
+            assert!(
+                h_nyugyoku.len() <= self.cap_scalar * NYUGYOKU_SCALAR_DIMS,
+                "entering-king scalars ({}) exceed pinned capacity {}",
+                h_nyugyoku.len(),
+                self.cap_scalar * NYUGYOKU_SCALAR_DIMS
+            );
+        }
         let slot = self.step % 2;
         if self.step >= 2 {
             self.copy_stream.wait(&self.step_done[slot])?;
@@ -1275,6 +1351,9 @@ impl InputUploadRing {
             std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
+            if let (Some((_, h_nyugyoku)), Some(pinned)) = (nyugyoku, self.pinned_nyugyoku) {
+                std::ptr::copy_nonoverlapping(h_nyugyoku.as_ptr(), pinned[slot], h_nyugyoku.len());
+            }
         }
         let cs: &CudaStream = &self.copy_stream;
         // SAFETY: pinned[slot] は直上で先頭 `h_*.len()` 要素を初期化済、`from_raw_parts`
@@ -1305,6 +1384,15 @@ impl InputUploadRing {
                 dev_wdl,
                 std::slice::from_raw_parts(self.pinned_wdl[slot], h_wdl.len()),
             )?;
+            if let (Some((dev_nyugyoku, h_nyugyoku)), Some(pinned)) =
+                (nyugyoku, self.pinned_nyugyoku)
+            {
+                copy_host_to_device_async_u8(
+                    cs,
+                    dev_nyugyoku,
+                    std::slice::from_raw_parts(pinned[slot], h_nyugyoku.len()),
+                )?;
+            }
         }
         self.h2d_done[slot].record(cs)?;
         compute_stream.wait(&self.h2d_done[slot])?;
@@ -1351,6 +1439,14 @@ impl Drop for InputUploadRing {
             }
         }
         for slot in self.pinned_score.iter().chain(self.pinned_wdl.iter()) {
+            if !slot.is_null() {
+                // SAFETY: 同上。
+                unsafe {
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
+                }
+            }
+        }
+        for slot in self.pinned_nyugyoku.iter().flatten() {
             if !slot.is_null() {
                 // SAFETY: 同上。
                 unsafe {

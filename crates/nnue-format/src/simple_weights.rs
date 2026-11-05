@@ -538,6 +538,83 @@ impl SimpleWeights {
             l3_b: i32s(&q.l3_b),
         })
     }
+
+    /// 入玉スカラーなしのネットを、L1 の入力に入玉スカラーを連結した構成 (`config`) に
+    /// 広げる。L1 weight の各行 (出力 `o`) の後ろに `scalar_l1_w[o * 96..(o + 1) * 96]`
+    /// (`l1_out × NYUGYOKU_SCALAR_DIMS`、out-major) を足し、他の weight はそのまま使う。
+    /// `scalar_l1_w` が全て 0 なら、広げたネットは元のネットと同じ関数になる
+    /// (L1 の積和に足されるのが 0 × スカラーだけのため)。
+    pub fn with_nyugyoku_scalar(
+        mut self,
+        config: NyugyokuScalarConfig,
+        scalar_l1_w: &[f32],
+    ) -> io::Result<Self> {
+        if self.id.nyugyoku_scalar.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the net already has entering-king scalar inputs",
+            ));
+        }
+        let id = SimpleId {
+            nyugyoku_scalar: Some(config),
+            ..self.id
+        };
+        id.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.check_buffer_lengths()?;
+        let (l1_out, ft_dim) = (id.l1_out, id.ft_output_dim());
+        if scalar_l1_w.len() != l1_out * NYUGYOKU_SCALAR_DIMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "entering-king scalar L1 weights have {} elements, expected {}",
+                    scalar_l1_w.len(),
+                    l1_out * NYUGYOKU_SCALAR_DIMS
+                ),
+            ));
+        }
+        let mut l1_w = Vec::with_capacity(l1_out * id.combined_dim());
+        for o in 0..l1_out {
+            l1_w.extend_from_slice(&self.l1_w[o * ft_dim..(o + 1) * ft_dim]);
+            l1_w.extend_from_slice(
+                &scalar_l1_w[o * NYUGYOKU_SCALAR_DIMS..(o + 1) * NYUGYOKU_SCALAR_DIMS],
+            );
+        }
+        self.id = id;
+        self.l1_w = l1_w;
+        Ok(self)
+    }
+
+    /// 学習の初期値 (`--init-from`) として quantised binary を読む。`expected` が入玉スカラー
+    /// つきの構成なら、同じ構成の入玉スカラーつきのネットに加えて、入玉スカラーなしのネット
+    /// (同じ feature set・活性化・層次元) も受け付け、[`with_nyugyoku_scalar`] で広げる。
+    /// どちらかは network hash で決める。広げたときの L1 の追加列は `scalar_l1_w()` の値
+    /// (`l1_out × NYUGYOKU_SCALAR_DIMS`、out-major)。戻り値の `bool` は広げたかどうか。
+    ///
+    /// [`with_nyugyoku_scalar`]: Self::with_nyugyoku_scalar
+    pub fn load_for_init<R: Read>(
+        reader: &mut R,
+        expected: SimpleId,
+        scalar_l1_w: impl FnOnce() -> Vec<f32>,
+    ) -> io::Result<(Self, bool)> {
+        let Some(config) = expected.nyugyoku_scalar else {
+            return Ok((Self::load(reader, expected)?, false));
+        };
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let without = SimpleId {
+            nyugyoku_scalar: None,
+            ..expected
+        };
+        let file_hash = bytes
+            .get(4..8)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if file_hash == Some(network_hash(&without)) {
+            let weights = Self::load(&mut bytes.as_slice(), without)?;
+            return Ok((weights.with_nyugyoku_scalar(config, &scalar_l1_w())?, true));
+        }
+        Ok((Self::load(&mut bytes.as_slice(), expected)?, false))
+    }
 }
 
 /// Simple quantised binary の header (version・network hash・arch 文字列) を読み、`expected`

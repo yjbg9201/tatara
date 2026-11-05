@@ -1,7 +1,7 @@
 //! 入玉スカラーの密入力を持つ Simple ネットの format と量子化 CPU forward のテスト。
 
 use nnue_format::simple_weights::{
-    build_arch_str, network_hash, nyugyoku_scalar_hash, nyugyoku_scalar_token,
+    build_arch_str, network_hash, nyugyoku_scalar_hash, nyugyoku_scalar_token, pad32,
 };
 use nnue_format::{SimpleActivation, SimpleId, SimpleQuantised, SimpleWeights};
 use shogi_features::{
@@ -253,4 +253,215 @@ fn forward_reads_scalars_from_the_tail_columns() {
         assert_eq!(q.forward_raw(&board).unwrap(), h1, "{sfen}");
         assert_eq!(q.evaluate(&board).unwrap(), h1, "{sfen}");
     }
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+/// 平手と同じ駒の組 (玉以外 38 枚) を盤上・持ち駒にランダムに配った局面。合法性は問わない。
+/// 玉は盤上のどこにでも置くので、入玉した局面 (敵陣の玉・敵陣の駒) も多く含む。
+fn random_full_set_board(rng: &mut XorShift64) -> shogi_format::ShogiBoard {
+    use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
+    const PIECES: [(PieceType, Option<PieceType>, u64); 7] = [
+        (PieceType::Pawn, Some(PieceType::ProPawn), 18),
+        (PieceType::Lance, Some(PieceType::ProLance), 4),
+        (PieceType::Knight, Some(PieceType::ProKnight), 4),
+        (PieceType::Silver, Some(PieceType::ProSilver), 4),
+        (PieceType::Gold, None, 4),
+        (PieceType::Bishop, Some(PieceType::Horse), 2),
+        (PieceType::Rook, Some(PieceType::Dragon), 2),
+    ];
+    let color_of = |bit: u64| if bit == 0 { Color::Black } else { Color::White };
+    let mut board = ShogiBoard {
+        side_to_move: color_of(rng.below(2)),
+        ..Default::default()
+    };
+    let place = |board: &mut ShogiBoard, rng: &mut XorShift64, piece: Piece| loop {
+        let sq = Square::from_index(rng.below(81) as usize);
+        if board.board[sq.index()].is_none() {
+            board.board[sq.index()] = piece;
+            return sq;
+        }
+    };
+    board.black_king_sq = place(&mut board, rng, Piece::new(Color::Black, PieceType::King));
+    board.white_king_sq = place(&mut board, rng, Piece::new(Color::White, PieceType::King));
+    let (mut black_hand, mut white_hand) = (Hand::EMPTY, Hand::EMPTY);
+    for (pt, promoted, count) in PIECES {
+        for _ in 0..count {
+            let color = color_of(rng.below(2));
+            if rng.below(4) == 0 {
+                let hand = if color == Color::Black {
+                    &mut black_hand
+                } else {
+                    &mut white_hand
+                };
+                hand.set(pt, hand.count(pt) + 1);
+            } else {
+                let on_board = match promoted {
+                    Some(p) if rng.below(5) == 0 => p,
+                    _ => pt,
+                };
+                place(&mut board, rng, Piece::new(color, on_board));
+            }
+        }
+    }
+    board.black_hand = black_hand;
+    board.white_hand = white_hand;
+    board
+}
+
+/// HalfKP 256x2-32-32 の入玉スカラーなしのネットを、入玉スカラーの列の L1 weight 0 で広げて
+/// 量子化 CPU forward で比べると、10,000 局面で出力層の生の値が元のネットと完全に一致する
+/// (ワームスタート直後の関数保存)。量子化した整数も FT と L1 の FT 列で元と同じになる。
+#[test]
+fn widening_a_net_without_scalars_keeps_the_function() {
+    let config = NyugyokuScalarConfig::default();
+    let (without, with) = (id(256, None), id(256, Some(config)));
+    let original = deterministic_weights(without);
+    let mut original_bytes = Vec::new();
+    original.save_quantised(&mut original_bytes).unwrap();
+
+    let zero_scalar_cols = || vec![0.0_f32; with.l1_out * NYUGYOKU_SCALAR_DIMS];
+    let (widened, was_widened) = SimpleWeights::load_for_init(
+        &mut std::io::Cursor::new(&original_bytes),
+        with,
+        zero_scalar_cols,
+    )
+    .unwrap();
+    assert!(was_widened);
+    assert_eq!(widened.id, with);
+    let mut widened_bytes = Vec::new();
+    widened.save_quantised(&mut widened_bytes).unwrap();
+
+    let q0 = SimpleQuantised::read(&mut std::io::Cursor::new(&original_bytes), without).unwrap();
+    let q1 = SimpleQuantised::read(&mut std::io::Cursor::new(&widened_bytes), with).unwrap();
+    assert_eq!(q0.fv_scale, q1.fv_scale);
+    assert_eq!(q0.ft_w, q1.ft_w);
+    assert_eq!(q0.ft_b, q1.ft_b);
+    assert_eq!(
+        (&q0.l1_b, &q0.l2_w, &q0.l2_b),
+        (&q1.l1_b, &q1.l2_w, &q1.l2_b)
+    );
+    assert_eq!((&q0.l3_w, &q0.l3_b), (&q1.l3_w, &q1.l3_b));
+    let (in0, in1) = (pad32(without.combined_dim()), pad32(with.combined_dim()));
+    let ft_dim = with.ft_output_dim();
+    for o in 0..with.l1_out {
+        assert_eq!(
+            q0.l1_w[o * in0..o * in0 + ft_dim],
+            q1.l1_w[o * in1..o * in1 + ft_dim]
+        );
+        assert!(
+            q1.l1_w[o * in1 + ft_dim..(o + 1) * in1]
+                .iter()
+                .all(|&w| w == 0)
+        );
+    }
+
+    let mut rng = XorShift64(0x2026_1105_0000_0004);
+    let boards: Vec<ShogiBoard> = (0..10_000)
+        .map(|_| random_full_set_board(&mut rng))
+        .collect();
+    let king_in_camp = boards
+        .iter()
+        .filter(|b| nyugyoku_scalars(b, config)[8] != 0)
+        .count();
+    assert!(
+        king_in_camp > 1_000,
+        "too few entering-king positions: {king_in_camp}"
+    );
+    let mut distinct = std::collections::BTreeSet::new();
+    for board in &boards {
+        let raw = q0.forward_raw(board).unwrap();
+        assert_eq!(q1.forward_raw(board).unwrap(), raw);
+        distinct.insert(raw);
+    }
+    assert!(
+        distinct.len() > 100,
+        "outputs barely vary: {}",
+        distinct.len()
+    );
+
+    // 入玉スカラーの列に 0 でない weight を足すと出力が変わる (比較が素通りでない)。
+    let (noisy, _) =
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&original_bytes), with, || {
+            vec![1.0_f32; with.l1_out * NYUGYOKU_SCALAR_DIMS]
+        })
+        .unwrap();
+    let mut noisy_bytes = Vec::new();
+    noisy.save_quantised(&mut noisy_bytes).unwrap();
+    let q2 = SimpleQuantised::read(&mut std::io::Cursor::new(&noisy_bytes), with).unwrap();
+    let changed = boards
+        .iter()
+        .filter(|b| q2.forward_raw(b).unwrap() != q0.forward_raw(b).unwrap())
+        .count();
+    assert!(changed > 1_000, "scalar columns had no effect: {changed}");
+}
+
+/// `load_for_init` は入玉スカラーつきのネットをそのまま読み (広げない)、入玉スカラーなしの
+/// 構成では従来の `load` と同じ。別の構成 (層の幅違い、別ルール) のネットは拒否する。
+#[test]
+fn load_for_init_reads_matching_nets_and_rejects_others() {
+    let config = NyugyokuScalarConfig::default();
+    let with = id(32, Some(config));
+    let mut with_bytes = Vec::new();
+    deterministic_weights(with)
+        .save_quantised(&mut with_bytes)
+        .unwrap();
+    let unused = || -> Vec<f32> { panic!("must not widen a net that already has scalars") };
+    let (w, widened) =
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&with_bytes), with, unused).unwrap();
+    assert!(!widened);
+    assert_eq!(w.id, with);
+
+    let without = id(32, None);
+    let mut without_bytes = Vec::new();
+    deterministic_weights(without)
+        .save_quantised(&mut without_bytes)
+        .unwrap();
+    let (w, widened) =
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&without_bytes), without, Vec::new)
+            .unwrap();
+    assert!(!widened);
+    assert_eq!(w.id, without);
+
+    let zeros = || vec![0.0_f32; 32 * NYUGYOKU_SCALAR_DIMS];
+    // 層の幅が違う入玉スカラーなしのネット
+    let mut other_width = Vec::new();
+    deterministic_weights(id(64, None))
+        .save_quantised(&mut other_width)
+        .unwrap();
+    assert!(
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&other_width), with, zeros).is_err()
+    );
+    // 別ルールの入玉スカラーつきのネット
+    let csa24 = id(
+        32,
+        Some(NyugyokuScalarConfig {
+            rule: DeclarationRule::Csa24,
+            ..config
+        }),
+    );
+    let mut other_rule = Vec::new();
+    deterministic_weights(csa24)
+        .save_quantised(&mut other_rule)
+        .unwrap();
+    assert!(
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&other_rule), with, zeros).is_err()
+    );
+    // 広げる列の数が合わない
+    assert!(
+        SimpleWeights::load_for_init(&mut std::io::Cursor::new(&without_bytes), with, || vec![
+            0.0_f32;
+            3
+        ])
+        .is_err()
+    );
 }

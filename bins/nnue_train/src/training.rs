@@ -1527,17 +1527,6 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// simple トレーナは `--win-rate-model` (WRM) を必須とし、学習出力と量子化 export の
-/// score scale が一致することを検証する。非 WRM の loss_wdl は
-/// net_output ≈ cp (±数千) に収束するが、simple の quantised export は dense weight を
-/// int8 clamp (±127/QB ≈ ±1.98) で書くため、出力層がその大きな出力スケールを構成
-/// できず clamp 端へ飽和し、量子化ネットの評価値が破綻する。WRM 経路は
-/// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
-/// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
-///
-/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は CLI override、
-/// 読み込んだ net / checkpoint、`--scale` からの導出の順で決まる。override 未指定時は
-/// 読み込み元の有無にかかわらず両 scale の一致を必須とする。
 /// `simple --nyugyoku-rule` / `--nyugyoku-encoding` を入玉スカラーの設定に解釈する。
 /// 指定なしは `None`。密入力は CReLU のみ対応。
 #[cfg(any(feature = "gpu", test))]
@@ -1549,6 +1538,9 @@ pub(crate) fn simple_nyugyoku_scalar(
     let Some(rule_name) = &simple_args.nyugyoku_rule else {
         if simple_args.nyugyoku_encoding.is_some() {
             return Err("--nyugyoku-encoding requires --nyugyoku-rule".to_string());
+        }
+        if simple_args.nyugyoku_init_noise.is_some() {
+            return Err("--nyugyoku-init-noise requires --nyugyoku-rule".to_string());
         }
         return Ok(None);
     };
@@ -1564,6 +1556,13 @@ pub(crate) fn simple_nyugyoku_scalar(
             )
         })?,
     };
+    if let Some(noise) = simple_args.nyugyoku_init_noise
+        && (!noise.is_finite() || noise < 0.0)
+    {
+        return Err(format!(
+            "--nyugyoku-init-noise must be a finite value >= 0 (got {noise})"
+        ));
+    }
     if activation != nnue_format::SimpleActivation::CReLU {
         return Err(format!(
             "--nyugyoku-rule requires --activation crelu (got {})",
@@ -1573,6 +1572,17 @@ pub(crate) fn simple_nyugyoku_scalar(
     Ok(Some(NyugyokuScalarConfig { rule, encoding }))
 }
 
+/// simple トレーナは `--win-rate-model` (WRM) を必須とし、学習出力と量子化 export の
+/// score scale が一致することを検証する。非 WRM の loss_wdl は
+/// net_output ≈ cp (±数千) に収束するが、simple の quantised export は dense weight を
+/// int8 clamp (±127/QB ≈ ±1.98) で書くため、出力層がその大きな出力スケールを構成
+/// できず clamp 端へ飽和し、量子化ネットの評価値が破綻する。WRM 経路は
+/// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
+/// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
+///
+/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は CLI override、
+/// 読み込んだ net / checkpoint、`--scale` からの導出の順で決まる。override 未指定時は
+/// 読み込み元の有無にかかわらず両 scale の一致を必須とする。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
@@ -2387,14 +2397,6 @@ pub(crate) fn run_simple_training(
         feature_set
     };
     let nyugyoku_scalar = simple_nyugyoku_scalar(simple_args, activation)?;
-    if nyugyoku_scalar.is_some() {
-        // L1 入力に密入力の列を足す GPU 経路 (FT post カーネルの行幅など) は未実装。
-        return Err(
-            "--nyugyoku-rule: training a net with entering-king scalar inputs on the GPU is not \
-             supported yet"
-                .into(),
-        );
-    }
     let id = SimpleId {
         feature_set,
         activation,
@@ -2410,7 +2412,10 @@ pub(crate) fn run_simple_training(
 
     // `--init-l1-shared` は Simple では受け付けないため CUDA 初期化より前に解決して
     // 早期 reject する (CUDA context 作成のコストを払わせない)。
-    let init_spec = build_simple_init_spec(cli)?;
+    let mut init_spec = build_simple_init_spec(cli)?;
+    if let Some(noise) = simple_args.nyugyoku_init_noise {
+        init_spec.set_nyugyoku_init_noise(noise)?;
+    }
 
     std::fs::create_dir_all(&cli.output)?;
 
@@ -2496,7 +2501,19 @@ pub(crate) fn run_simple_training(
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = SimpleWeights::load(&mut reader, id)?;
+        // 入玉スカラーつきの構成では、入玉スカラーなしの同じ層のネットも受け付けて L1 を広げる
+        // (追加の列は新規の初期化と同じ `--nyugyoku-init-noise` の値)。
+        let (weights, widened) = SimpleWeights::load_for_init(&mut reader, id, || {
+            init_spec.sample_nyugyoku_l1_w_out_major(id.l1_out)
+        })?;
+        if widened {
+            println!(
+                "[train] --init-from: the net has no entering-king scalar inputs; widened L1 \
+                 from {} to {} inputs",
+                id.ft_output_dim(),
+                id.combined_dim()
+            );
+        }
         trainer.load_simple_weights(&weights)?;
         (None, None, None, None)
     } else if let Some(ckpt) = &cli.resume {

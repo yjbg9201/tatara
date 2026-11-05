@@ -551,3 +551,89 @@ YaneuraOu のエンジン内部だけを変えた。評価関数ファイルの�
 - 親局面が未評価のとき、さらに前の評価済みの局面まで遡って引き継ぐ (評価の 22% が該当)。
 - 駒を取る手 (評価の 24%) で、取られた側の状態を差分で更新する (盤上の駒数・大駒数・敵陣内の
   駒数が 1 つ減るだけ)。
+
+## 10. 段階4: trainer の拡張 (GPU 未検証)
+
+GPU の無い環境で実装した。CPU で確かめられる部分だけ確かめ、GPU で走らせる検証は
+[docs/nnue-nyugyoku-scalar-gpu-runbook.md](nnue-nyugyoku-scalar-gpu-runbook.md) の手順に残した。
+
+### 調査結果 (実装前)
+
+- **compute capability の下限**: 既定の CUDA C++ backend は `nvidia-smi` の値で PTX を作り、
+  検出できないときの既定も 75 (`crates/cuda-native-runtime/build.rs`)。kernel が使う命令で
+  最も新しいのは倍精度の `atomicAdd` (sm_60) で、sm_80 以上の命令 (`cp.async` など) は無い。
+  cuda-oxide の oracle は既定で sm_80 の PTX を作るので Turing では `CUDA_OXIDE_TARGET=sm_75` が
+  要る (`scripts/build-kernels.sh` が自動設定)。sm_80 以上の命令は Rust の kernel にも無い。
+  したがって **Quadro T1000 (sm_75) でビルド・実行できる** (setup 文書の記載どおり)。RTX 2070
+  (sm_75)・3050 (sm_86)・4090 (sm_89) も同じく使える。
+- **手元の環境**: CUDA Toolkit 12.x (`compute_75` を含む。12.9 で確認済み)、LLVM 21 以上
+  (22 推奨)、clang 21 / 22、Rust nightly-2026-04-03 (`rust-toolchain.toml`)、cargo-oxide
+  (`scripts/setup-cuda-oxide.sh`)。WSL2 では driver は Windows 側だけに入れる。
+- **VRAM**: HalfKP 256x2-32-32＋入玉スカラーの FP32 学習で、FT の state (weight・slow・
+  勾配・モーメント 2 本) が約 612 MB、batch あたり約 11 KB/局面、CUDA context と cuBLAS で
+  0.3〜0.6 GB。4 GB では batch 16,384 (既定) は約 1.2〜1.5 GB で余裕があり、65,536 (約 2 GB) が
+  目安の上限。
+
+### 実装
+
+- **FP32 融合カーネル 4 本の行幅**: `simple_ft_post_fused_{crelu,screlu}` と
+  `simple_bwd_ft_act_{crelu,screlu}_fused` (CUDA C++ と cuda-oxide の両方) に
+  `combined_stride` (`ft_out` の次の引数) を足し、`SimpleGpuTrainer` は `combined_dim` を渡す。
+  行の `[2*ft_out, combined_dim)` は forward が書かず、backward が読まない。
+- **CPU 参照実装 (仕様書との差異)**: 仕様書は 4 本に `*_cpu` 参照実装があると想定していたが、
+  実ソースには無かった (`gpu_cpu_equivalence_tests` にもこの 4 本の比較は無い)。そこで
+  `gpu_kernels::simple::ft_post` に行幅つきの参照実装を新設し、CPU テストで (1) 行幅
+  `2*ft_out` のとき、行幅を固定していた kernel の書き込み位置をそのまま書き写した実装と bit
+  単位で一致すること、(2) 融合前の kernel 列 (bias 加算 → 活性化 → `slice_scatter_2d`、
+  `slice_extract_2d` → 活性化の勾配) と一致すること、(3) 行幅 608 で FT の列は同じ値・密入力の
+  列は書かない / 読まない (NaN を置いても漏れない) ことを確かめた。
+- **backward の他の読み手**: `combined` / `dcombined` を読む他の経路は既に行幅を引数に取る
+  (`--ft-fp16-out` の `simple_bias_act_fwd_fp16_in_*` / `simple_act_grad_to_fp16_*`、cuBLAS の
+  L1、Pairwise)。FT の backward (`sparse_ft_backward`・FT bias 勾配) は `dft_*_out` だけを読み、
+  入玉スカラーの列 (512〜607) を読まない。
+- **入玉スカラーの書き込み**: `simple_nyugyoku_scalar_to_combined` (両 backend) が FT post の後に
+  u8 / 127 を `combined` の行末 96 列に書く。`combined` は FP16 の経路でも f32 なので、FP32・
+  FP16 の両経路で同じ kernel を使う。割り算は IEEE の丸めで、CPU 参照実装と bit 単位で一致する
+  はず (GPU テストで確認する)。入玉スカラーは学習データの定数で、`dcombined` の同じ列を読む
+  kernel は無い (入力側へ勾配を流さない)。L1 の weight 勾配は既存の Sgemm が 608 列ぶん求める。
+- **転送**: `BatchData` に入玉スカラーの設定と u8 の slice を足し、`InputUploadRing` に u8 の
+  pinned buffer を 1 組 (入玉スカラーつきの構成だけ)、workspace に active / back の device
+  buffer を足した。batch の設定 (ルール・符号化) が trainer と違うとき、量が足りないときは
+  step の前にエラーにする。入玉スカラーなしの構成では何も確保しない。
+- **初期化**: `SimpleInit::l1_w_nyugyoku` を足した。L1 の FT 出力の列は入玉スカラーなしの構成と
+  同じ形・同じ fan_in・同じ seed で作るので、入玉スカラーの有無で bit 単位で同じ値になる
+  (CPU テストで確認)。入玉スカラーの列は別の seed の一様ノイズ (半値幅は
+  `simple --nyugyoku-init-noise`、既定 0.001 = 他の dense 層の既定の 1/10、0 なら厳密に 0)。
+- **ワームスタート**: `SimpleWeights::load_for_init` は、入玉スカラーつきの構成で network hash が
+  「同じ層で入玉スカラーなし」のネットを受けると、L1 の各行に新規の初期化と同じノイズの列を
+  足して読む (`--init-from` が使う)。ノイズ 0 で広げたネットは、HalfKP 256x2-32-32 の乱数ネットで
+  10,000 局面 (平手と同じ駒の組をランダムに配置、玉が敵陣の局面 1,000 以上) の量子化 CPU
+  forward が元のネットと完全に一致し、量子化した整数も FT と L1 の FT の列で元と同じだった。
+  `--resume` (raw checkpoint) は広げない: optimizer の state を引き継ぐ再開の意味と合わない
+  ので、`.bin` を書き出して `--init-from` で始める。
+- **段階5のガード**: CLI と `SimpleGpuTrainer::new` の「入玉スカラーは GPU で未対応」の拒否を
+  外した (`SimpleGpuTrainer::new` は代わりに `SimpleId::validate` を呼ぶ)。
+- **smoke と道具**: `nnue-train simple` (smoke) に入玉スカラーつきの段を足した (ノイズ 0 で始め、
+  10 step で loss が下がり、入玉スカラーの列の weight が 0 から動き、量子化 round-trip 後の
+  forward が有限)。`simple_quantised_eval l1-norms` で `.bin` の L1 weight の列ブロックごとの
+  ノルムを出せるようにした。
+
+### クラウドでの確認 (GPU なし)
+
+- CPU テスト (GitHub Actions と同じ 3 コマンド): 825 件成功、失敗 0 (無視 2)。段階4で足した
+  CPU テストは `gpu_kernels::simple` の 6 件、`nnue_train::init` の 2 件、`nnue-format` の
+  ワームスタート 2 件、CLI 1 件 (と既存の CLI テストへの追加)。
+- GPU 限定コードの Rust の型検査: nvcc を空のファイルを書く代役に置き換え、cuda-oxide の
+  bindgen には pip の CUDA ヘッダを使い、`cargo check` / `cargo clippy -D warnings` を
+  native・oxide・oxide-parity の 3 構成 (`--all-targets`) で通した。これで段階3・段階5の
+  GPU 限定の変更も型検査できた (§7.1 の 1 項目めの Rust 側)。
+- CUDA C++ の compile: `native_kernels.cu` / `progress_kernels.cu` を clang 18 と CUDA 12.9 の
+  ヘッダで sm_75 の PTX に compile できた (nvcc と ptxas は実行していない)。
+- GPU で走らせていないもの: kernel の GPU/CPU 同等性テスト 3 件、trainer の GPU テスト 4 件
+  (forward の CPU 参照との一致、ワームスタートの出力一致、学習で入玉スカラーの列が動く、
+  CUDA C++ と cuda-oxide の一致)、smoke、`scripts/local-ci.sh`、数 superbatch の学習。
+
+### その他
+
+- 段階5で `training.rs` の `require_simple_win_rate_model` の doc コメントの途中に
+  `simple_nyugyoku_scalar` を挟み込んでいたので、元の位置に戻した。

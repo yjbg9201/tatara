@@ -1898,11 +1898,48 @@ fn simple_nyugyoku_scalar_flags_parse_into_config() {
             &["--nyugyoku-rule", "csa27"][..],
             SimpleActivation::Pairwise,
         ),
+        (
+            &["--nyugyoku-init-noise", "0.01"][..],
+            SimpleActivation::CReLU,
+        ),
+        (
+            &["--nyugyoku-rule", "csa27", "--nyugyoku-init-noise=-0.5"][..],
+            SimpleActivation::CReLU,
+        ),
+        (
+            &["--nyugyoku-rule", "csa27", "--nyugyoku-init-noise", "NaN"][..],
+            SimpleActivation::CReLU,
+        ),
     ] {
         assert!(
             simple_nyugyoku_scalar(&simple_args(argv), activation).is_err(),
             "{argv:?} {activation:?}"
         );
+    }
+}
+
+/// `--nyugyoku-init-noise` は 0 を含む有限の非負値を受け付け、初期化の指定に入る。
+#[test]
+fn simple_nyugyoku_init_noise_accepts_zero() {
+    use crate::training::simple_nyugyoku_scalar;
+    use nnue_format::SimpleActivation;
+    use nnue_train::init::{LayerInit, SimpleInit};
+
+    for noise in ["0", "0.0005"] {
+        let args = simple_args(&["--nyugyoku-rule", "csa27", "--nyugyoku-init-noise", noise]);
+        assert!(simple_nyugyoku_scalar(&args, SimpleActivation::CReLU).is_ok());
+        let value = args.nyugyoku_init_noise.unwrap();
+        let mut init = SimpleInit::default_uniform();
+        init.set_nyugyoku_init_noise(value).unwrap();
+        if value == 0.0 {
+            assert_eq!(init.l1_w_nyugyoku, LayerInit::zeroed());
+        } else {
+            assert!(
+                init.sample_nyugyoku_l1_w_in_major(32)
+                    .iter()
+                    .all(|w| w.abs() <= value)
+            );
+        }
     }
 }
 

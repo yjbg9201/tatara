@@ -15,6 +15,9 @@
 //! - `pointwise`: pointwise fused kernel suite の reference CPU 置き場
 //!   (SCReLU fwd / grad、WDL loss、WRM loss、norm loss、AdamW / RAdam / Ranger)
 //! - `sparse`: sparse FT kernel suite (forward / backward) の reference CPU
+//! - `simple`: Simple arch 用 kernel 群 (FT post / activation backward の融合 kernel、
+//!   L1 入力への密入力の書き込み) の reference CPU。kernel ↔ CPU ref 対応表は [`simple`]
+//!   module doc 参照
 //! - `layerstack`: LayerStack arch 用 kernel 群
 //!   (`ft_post_perspective` / `dense_mm` (+ bucket) / `crelu` /
 //!   `abs_pow2_scale` / `concat_l1sqr_main` / `elementwise` / `slice2d` /
@@ -27,4 +30,5 @@
 pub mod layerstack;
 pub mod pointwise;
 pub mod progress;
+pub mod simple;
 pub mod sparse;

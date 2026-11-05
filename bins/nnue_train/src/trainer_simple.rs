@@ -5,6 +5,7 @@ use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::OptimizerKind;
 use nnue_train::trainer::{CheckpointProducer, LossKind};
+use shogi_features::nyugyoku_scalar::NYUGYOKU_SCALAR_DIMS;
 
 use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
@@ -125,6 +126,10 @@ pub(crate) struct SimpleGpuWorkspace {
     nnz_dev_back: DeviceBuffer<i32>,
     score_dev_back: DeviceBuffer<f32>,
     wdl_dev_back: DeviceBuffer<f32>,
+    /// 入玉スカラー (`b × NYUGYOKU_SCALAR_DIMS`、u8) の active / back。入玉スカラーつきの
+    /// 構成 (`SimpleId::nyugyoku_scalar` が `Some`) だけが確保する。
+    nyugyoku_dev: Option<DeviceBuffer<u8>>,
+    nyugyoku_dev_back: Option<DeviceBuffer<u8>>,
 }
 
 impl SimpleGpuWorkspace {
@@ -145,6 +150,16 @@ impl SimpleGpuWorkspace {
         let alloc_h = |on: bool| -> Result<Option<DeviceBuffer<f16>>, Box<dyn std::error::Error>> {
             if on {
                 Ok(Some(DeviceBuffer::<f16>::zeroed(stream, batch * ft_out)?))
+            } else {
+                Ok(None)
+            }
+        };
+        let alloc_u8 = |on: bool| -> Result<Option<DeviceBuffer<u8>>, Box<dyn std::error::Error>> {
+            if on {
+                Ok(Some(DeviceBuffer::<u8>::zeroed(
+                    stream,
+                    batch * NYUGYOKU_SCALAR_DIMS,
+                )?))
             } else {
                 Ok(None)
             }
@@ -189,6 +204,8 @@ impl SimpleGpuWorkspace {
             nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            nyugyoku_dev: alloc_u8(id.nyugyoku_scalar.is_some())?,
+            nyugyoku_dev_back: alloc_u8(id.nyugyoku_scalar.is_some())?,
         })
     }
 
@@ -209,6 +226,35 @@ impl SimpleGpuWorkspace {
         }
         Ok(())
     }
+}
+
+/// `batch` の入玉スカラーが trainer の構成 (`SimpleId::nyugyoku_scalar`) と合うかを検査する。
+/// 設定 (ルール・符号化) が違う、または入玉スカラーつきの構成で `n_pos × 96` 個に足りないと
+/// error。入玉スカラーなしの構成では `batch` 側の値を読まない。
+pub(crate) fn check_nyugyoku_inputs(
+    id: &SimpleId,
+    batch: &BatchData,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if id.nyugyoku_scalar.is_none() {
+        return Ok(());
+    }
+    if batch.nyugyoku_scalar != id.nyugyoku_scalar {
+        return Err(format!(
+            "SimpleGpuTrainer: batch entering-king scalar config {:?} does not match the net \
+             ({:?})",
+            batch.nyugyoku_scalar, id.nyugyoku_scalar
+        )
+        .into());
+    }
+    let need = batch.n_pos * NYUGYOKU_SCALAR_DIMS;
+    if batch.nyugyoku_scalars.len() < need {
+        return Err(format!(
+            "SimpleGpuTrainer: batch has {} entering-king scalar values, expected {need}",
+            batch.nyugyoku_scalars.len()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Simple 4 層アーキ用 GPU トレーナ。LayerStack 用 `GpuTrainer` と並ぶもう一方の
@@ -407,14 +453,7 @@ impl SimpleGpuTrainer {
         if precision.ft_fp16_out && !precision.ft_fp16 {
             return Err("--ft-fp16-out requires --ft-fp16".into());
         }
-        // FP32 の FT post 融合カーネルは `combined` の行幅を `2 * ft_out` と仮定しており、
-        // 入玉スカラーの列を足した L1 入力には未対応。
-        if id.nyugyoku_scalar.is_some() {
-            return Err(
-                "SimpleGpuTrainer: entering-king scalar inputs are not supported by the GPU trainer yet"
-                    .into(),
-            );
-        }
+        id.validate()?;
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
@@ -465,7 +504,8 @@ impl SimpleGpuTrainer {
         ft_w_init.resize(train_ft_in * ft_out, 0.0);
         let ft_b_h = init::sample(WeightShape::flat(ft_out, ft_in), &init_spec.ft_b);
         let l1_in = id.combined_dim();
-        let l1_w_h = init::sample(WeightShape::flat(l1_in * l1_out, l1_in), &init_spec.l1_w);
+        let l1_w_h =
+            init_spec.sample_l1_w(id.ft_output_dim(), id.l1_out, id.nyugyoku_scalar.is_some());
         let l1_b_h = init::sample(WeightShape::flat(l1_out, l1_in), &init_spec.l1_b);
         let l2_w_h = init::sample(WeightShape::flat(l1_out * l2_out, l1_out), &init_spec.l2_w);
         let l2_b_h = init::sample(WeightShape::flat(l2_out, l1_out), &init_spec.l2_b);
@@ -568,7 +608,12 @@ impl SimpleGpuTrainer {
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
-            input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
+            input_ring: InputUploadRing::new_simple(
+                ctx,
+                batch,
+                id.feature_set.max_active(),
+                id.nyugyoku_scalar.is_some(),
+            )?,
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb (base 形状)、
             // 無効時の `ft_w_h` は master の cast mirror (train 形状 = base と同値)。いずれも
             // `sync_ft_forward_weights` が初期同期する。
@@ -670,8 +715,8 @@ impl SimpleGpuTrainer {
         self.ft_w.to_host_vec(&self.stream).map_err(Into::into)
     }
 
-    /// `l1_w` を host へ download する (optimizer 配線検証テスト用)。
-    #[cfg(test)]
+    /// `l1_w` (device 配置の in-major、`[combined_dim][l1_out]`) を host へ download する
+    /// (optimizer 配線検証テストと、smoke の入玉スカラーの列の weight の確認用)。
     pub(crate) fn l1_w_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.l1_w.to_host_vec(&self.stream).map_err(Into::into)
     }
@@ -739,6 +784,7 @@ impl SimpleGpuTrainer {
             return Ok(0.0);
         }
         self.ws.check_batch_capacity(b)?;
+        check_nyugyoku_inputs(&self.id, batch)?;
         self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(loss_host[0])
@@ -762,6 +808,7 @@ impl SimpleGpuTrainer {
             return Ok(0.0);
         }
         self.ws.check_batch_capacity(b)?;
+        check_nyugyoku_inputs(&self.id, batch)?;
 
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
@@ -781,6 +828,12 @@ impl SimpleGpuTrainer {
         std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
         std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
         std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
+        std::mem::swap(&mut self.ws.nyugyoku_dev, &mut self.ws.nyugyoku_dev_back);
+        let nyugyoku_upload = self
+            .ws
+            .nyugyoku_dev
+            .as_ref()
+            .map(|dev| (dev, &batch.nyugyoku_scalars[..b * NYUGYOKU_SCALAR_DIMS]));
         self.input_ring.upload_simple(
             &self.stream,
             &self.ws.stm_idx_dev,
@@ -793,6 +846,7 @@ impl SimpleGpuTrainer {
             &batch.score[..b],
             &self.ws.wdl_dev,
             &batch.wdl[..b],
+            nyugyoku_upload,
         )?;
 
         self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
@@ -922,6 +976,13 @@ impl SimpleGpuTrainer {
             copy_host_to_device_async_i32(&self.stream, &self.ws.nnz_dev, &batch.nnz[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+            if let Some(dev) = &self.ws.nyugyoku_dev {
+                copy_host_to_device_async_u8(
+                    &self.stream,
+                    dev,
+                    &batch.nyugyoku_scalars[..b * NYUGYOKU_SCALAR_DIMS],
+                )?;
+            }
         }
 
         // -- loss_acc / weight_sum_acc を 0 にリセット (再 alloc 無し) --
@@ -1072,7 +1133,8 @@ impl SimpleGpuTrainer {
         if self.ft_fp16_out {
             // CReLU / SCReLU は nstm を `col_offset = ft_out` で combined に直書きするため
             // `2*ft_out <= combined_dim` (= row stride) が成立しないと OOB write になる。
-            // CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // CReLU/SCReLU の combined_dim は両 perspective の連結 2*ft_out (入玉スカラーつきは
+            // + 96) なので常に成立。
             // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
             debug_assert!(
                 !matches!(
@@ -1188,6 +1250,14 @@ impl SimpleGpuTrainer {
             // `ft_*_acted` buffer の DRAM write+read と、bias_add → 活性化 間の `ft_*_out`
             // 再 read+write が消える (1 perspective につき ~536 MB DRAM、2 perspective で
             // ~1.07 GB)。`ft_fp16_out` 経路は scale / clamp / f16 cast 含むため融合外。
+            // 行幅は `combined_dim` を渡す (入玉スカラーつきでは行末の 96 列を書かない)。
+            debug_assert!(
+                !matches!(
+                    self.id.activation,
+                    SimpleActivation::CReLU | SimpleActivation::SCReLU
+                ) || 2 * ft_out_u32 <= l1_in_u32,
+                "CReLU/SCReLU fwd needs 2*ft_out <= combined_dim (got 2*{ft_out_u32} vs {l1_in_u32})"
+            );
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     unsafe {
@@ -1200,7 +1270,7 @@ impl SimpleGpuTrainer {
                                 slice_mut(self.ws.ft_stm_out),
                                 slice(self.ft_b),
                                 slice_mut(self.ws.combined),
-                                b_u32, ft_out_u32, 0_u32
+                                b_u32, ft_out_u32, l1_in_u32, 0_u32
                             ]
                         }
                     }?;
@@ -1214,7 +1284,7 @@ impl SimpleGpuTrainer {
                                 slice_mut(self.ws.ft_nstm_out),
                                 slice(self.ft_b),
                                 slice_mut(self.ws.combined),
-                                b_u32, ft_out_u32, ft_out_u32
+                                b_u32, ft_out_u32, l1_in_u32, ft_out_u32
                             ]
                         }
                     }?;
@@ -1230,7 +1300,7 @@ impl SimpleGpuTrainer {
                                 slice_mut(self.ws.ft_stm_out),
                                 slice(self.ft_b),
                                 slice_mut(self.ws.combined),
-                                b_u32, ft_out_u32, 0_u32
+                                b_u32, ft_out_u32, l1_in_u32, 0_u32
                             ]
                         }
                     }?;
@@ -1244,7 +1314,7 @@ impl SimpleGpuTrainer {
                                 slice_mut(self.ws.ft_nstm_out),
                                 slice(self.ft_b),
                                 slice_mut(self.ws.combined),
-                                b_u32, ft_out_u32, ft_out_u32
+                                b_u32, ft_out_u32, l1_in_u32, ft_out_u32
                             ]
                         }
                     }?;
@@ -1272,6 +1342,29 @@ impl SimpleGpuTrainer {
                     }?;
                 }
             }
+        }
+
+        // -- 入玉スカラー: `combined` の各行の末尾 `[2*ft_out, combined_dim)` に u8 / 127 を書く。
+        // FP32 / FP16 どちらの FT 経路でも `combined` は f32 なので同じ kernel を使う。入力は
+        // 学習データの定数で、backward は `dcombined` の同じ列を読まない (入力側へ勾配を流さない)。
+        if let Some(nyugyoku_dev) = &self.ws.nyugyoku_dev {
+            let scalar_dim_u32 = NYUGYOKU_SCALAR_DIMS as u32;
+            debug_assert_eq!(2 * ft_out_u32 + scalar_dim_u32, l1_in_u32);
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。`nyugyoku_dev` は
+                // `b × NYUGYOKU_SCALAR_DIMS` 以上 (`check_batch_capacity`)、書き込み先は
+                // `2*ft_out + NYUGYOKU_SCALAR_DIMS == combined_dim` の範囲に収まる。
+                cuda_launch! {
+                    kernel: simple_nyugyoku_scalar_to_combined,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(b * NYUGYOKU_SCALAR_DIMS),
+                    args: [
+                        slice(nyugyoku_dev), slice_mut(self.ws.combined),
+                        l1_in_u32, 2 * ft_out_u32, b_u32, scalar_dim_u32
+                    ]
+                }
+            }?;
         }
 
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
@@ -1795,7 +1888,8 @@ impl SimpleGpuTrainer {
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
             // CReLU / SCReLU は nstm を `col_offset = ft_out` で dcombined から直接読むため
             // `2*ft_out <= combined_dim` (= dcombined row stride) が成立しないと OOB read に
-            // なる。CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // なる。CReLU/SCReLU の combined_dim は両 perspective の連結 2*ft_out (入玉スカラー
+            // つきは + 96) なので常に成立。
             // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
             debug_assert!(
                 !matches!(
@@ -1982,7 +2076,8 @@ impl SimpleGpuTrainer {
                             kernel: simple_bwd_ft_act_crelu_fused,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                             args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
-                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32,
+                                   l1_in_u32, 0_u32]
                         }
                     }?;
                     unsafe {
@@ -1992,7 +2087,8 @@ impl SimpleGpuTrainer {
                             kernel: simple_bwd_ft_act_crelu_fused,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                             args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
-                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32,
+                                   l1_in_u32, ft_out_u32]
                         }
                     }?;
                 }
@@ -2004,7 +2100,8 @@ impl SimpleGpuTrainer {
                             kernel: simple_bwd_ft_act_screlu_fused,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                             args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
-                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32,
+                                   l1_in_u32, 0_u32]
                         }
                     }?;
                     unsafe {
@@ -2014,7 +2111,8 @@ impl SimpleGpuTrainer {
                             kernel: simple_bwd_ft_act_screlu_fused,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                             args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
-                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32,
+                                   l1_in_u32, ft_out_u32]
                         }
                     }?;
                 }
@@ -3064,6 +3162,7 @@ impl SimpleGpuTrainer {
             });
         }
         self.ws.check_batch_capacity(b)?;
+        check_nyugyoku_inputs(&self.id, batch)?;
         self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let net_output = self.ws.net_output.to_host_vec(&self.stream)?[..b].to_vec();
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;

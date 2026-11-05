@@ -2220,6 +2220,7 @@ extern "C" __global__ void simple_ft_post_fused_crelu(
     unsigned long long,
     unsigned int batch,
     unsigned int ft_columns,
+    unsigned int combined_stride,
     unsigned int destination_offset
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2230,7 +2231,7 @@ extern "C" __global__ void simple_ft_post_fused_crelu(
     const unsigned int column = i % ft_columns;
     const float value = ft_output[i] + bias[column];
     ft_output[i] = value;
-    combined[row * (2 * ft_columns) + destination_offset + column] =
+    combined[row * combined_stride + destination_offset + column] =
         value <= 0.0F ? 0.0F : (value >= 1.0F ? 1.0F : value);
 }
 
@@ -2243,6 +2244,7 @@ extern "C" __global__ void simple_ft_post_fused_screlu(
     unsigned long long,
     unsigned int batch,
     unsigned int ft_columns,
+    unsigned int combined_stride,
     unsigned int destination_offset
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2254,7 +2256,7 @@ extern "C" __global__ void simple_ft_post_fused_screlu(
     const float value = ft_output[i] + bias[column];
     ft_output[i] = value;
     const float clipped = value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
-    combined[row * (2 * ft_columns) + destination_offset + column] = clipped * clipped;
+    combined[row * combined_stride + destination_offset + column] = clipped * clipped;
 }
 
 extern "C" __global__ void simple_bwd_ft_act_crelu_fused(
@@ -2266,6 +2268,7 @@ extern "C" __global__ void simple_bwd_ft_act_crelu_fused(
     unsigned long long,
     unsigned int batch,
     unsigned int ft_columns,
+    unsigned int combined_stride,
     unsigned int source_offset
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2276,7 +2279,7 @@ extern "C" __global__ void simple_bwd_ft_act_crelu_fused(
     const unsigned int column = i % ft_columns;
     const float x = ft_pre_activation[i];
     ft_gradient[i] = x > 0.0F && x < 1.0F
-        ? combined_gradient[row * (2 * ft_columns) + source_offset + column]
+        ? combined_gradient[row * combined_stride + source_offset + column]
         : 0.0F;
 }
 
@@ -2289,6 +2292,7 @@ extern "C" __global__ void simple_bwd_ft_act_screlu_fused(
     unsigned long long,
     unsigned int batch,
     unsigned int ft_columns,
+    unsigned int combined_stride,
     unsigned int source_offset
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2301,7 +2305,29 @@ extern "C" __global__ void simple_bwd_ft_act_screlu_fused(
     const float clipped = x < 0.0F ? 0.0F : (x > 1.0F ? 1.0F : x);
     const float derivative = clipped > 0.0F && clipped < 1.0F ? 2.0F * clipped : 0.0F;
     ft_gradient[i] =
-        combined_gradient[row * (2 * ft_columns) + source_offset + column] * derivative;
+        combined_gradient[row * combined_stride + source_offset + column] * derivative;
+}
+
+// 入玉スカラー (u8、batch × scalar_dim、127 が 1.0) を `combined` の各行の
+// [column_offset, column_offset + scalar_dim) に u8 / 127 で書く。入力は定数なので backward は無い。
+extern "C" __global__ void simple_nyugyoku_scalar_to_combined(
+    const unsigned char* scalars,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    unsigned int batch,
+    unsigned int scalar_dim
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * scalar_dim) {
+        return;
+    }
+    const unsigned int row = i / scalar_dim;
+    const unsigned int column = i % scalar_dim;
+    combined[row * combined_stride + column_offset + column] =
+        static_cast<float>(scalars[i]) / 127.0F;
 }
 
 extern "C" __global__ void ft_post_perspective_fwd(

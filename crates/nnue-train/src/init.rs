@@ -106,6 +106,8 @@ impl WeightShape {
     }
 }
 
+use shogi_features::NYUGYOKU_SCALAR_DIMS;
+
 /// xorshift64。`(s >> 11) / 2^53` で `[0, 1)` の一様乱数を作る。既定初期化が呼ぶ
 /// `Uniform` + `Abs(0.01)` 経路は本実装で bit-identical な列を生成する。
 struct XorShift {
@@ -211,7 +213,7 @@ pub fn sample(shape: WeightShape, init: &LayerInit) -> Vec<f32> {
 // 既定初期化の group 別固定 seed。`--init-{ft,l1,...}` override を併用しても seed は
 // この固定値を保つので、同じ override 指定なら常に同じ初期重み列を再現する。
 const DEFAULT_LS_SEEDS: [u64; 5] = [0x100, 0x101, 0x102, 0x103, 0x104];
-const DEFAULT_SIMPLE_SEEDS: [u64; 8] = [
+const DEFAULT_SIMPLE_SEEDS: [u64; 9] = [
     0x5071_e001,
     0x5071_e002,
     0x5071_e003,
@@ -220,7 +222,11 @@ const DEFAULT_SIMPLE_SEEDS: [u64; 8] = [
     0x5071_e006,
     0x5071_e007,
     0x5071_e008,
+    0x5071_e009,
 ];
+
+/// 入玉スカラーの列の L1 weight に足すノイズの既定の半値幅 (他の dense 層の既定 0.01 の 1/10)。
+pub const DEFAULT_NYUGYOKU_INIT_NOISE: f32 = 0.001;
 
 const DEFAULT_HALF_WIDTH: f32 = 0.01;
 
@@ -289,10 +295,15 @@ pub struct SimpleInit {
     pub l2_b: LayerInit,
     pub l3_w: LayerInit,
     pub l3_b: LayerInit,
+    /// L1 weight のうち入玉スカラーの列 (入玉スカラーつきの構成だけが使う)。FT 出力の列は
+    /// `l1_w` から入玉スカラーなしの構成と同じ列・同じ fan_in で作り、この列はその後ろに足す。
+    /// 既存ネットからのワームスタートで足す列にも同じ値を使う。
+    pub l1_w_nyugyoku: LayerInit,
 }
 
 impl SimpleInit {
-    /// 既定初期化: weight・bias とも `[-0.01, 0.01]` 一様 (固定 seed)。
+    /// 既定初期化: weight・bias とも `[-0.01, 0.01]` 一様 (固定 seed)。入玉スカラーの列の
+    /// L1 weight は `[-DEFAULT_NYUGYOKU_INIT_NOISE, +DEFAULT_NYUGYOKU_INIT_NOISE]` 一様。
     pub fn default_uniform() -> Self {
         Self {
             ft_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[0]),
@@ -303,7 +314,56 @@ impl SimpleInit {
             l2_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[5]),
             l3_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[6]),
             l3_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[7]),
+            l1_w_nyugyoku: nyugyoku_l1_noise(DEFAULT_NYUGYOKU_INIT_NOISE),
         }
+    }
+
+    /// L1 weight の初期値 (trainer の device 配置 = in-major、`[入力][l1_out]`)。FT 出力の列
+    /// (`ft_output_dim` 行) は入玉スカラーなしの構成と同じ形・同じ fan_in で `l1_w` から作るので、
+    /// 入玉スカラーの有無で bit 単位で同じ値になる。`nyugyoku` のときはその後ろに
+    /// `l1_w_nyugyoku` の `NYUGYOKU_SCALAR_DIMS` 行を足す。
+    pub fn sample_l1_w(&self, ft_output_dim: usize, l1_out: usize, nyugyoku: bool) -> Vec<f32> {
+        let mut l1_w = sample(
+            WeightShape::flat(ft_output_dim * l1_out, ft_output_dim),
+            &self.l1_w,
+        );
+        if nyugyoku {
+            l1_w.extend(self.sample_nyugyoku_l1_w_in_major(l1_out));
+        }
+        l1_w
+    }
+
+    /// 入玉スカラーの列の L1 weight の初期値 (in-major、`[NYUGYOKU_SCALAR_DIMS][l1_out]`)。
+    pub fn sample_nyugyoku_l1_w_in_major(&self, l1_out: usize) -> Vec<f32> {
+        sample(
+            WeightShape::flat(NYUGYOKU_SCALAR_DIMS * l1_out, NYUGYOKU_SCALAR_DIMS),
+            &self.l1_w_nyugyoku,
+        )
+    }
+
+    /// [`sample_nyugyoku_l1_w_in_major`](Self::sample_nyugyoku_l1_w_in_major) を
+    /// `SimpleWeights` の配置 (out-major、`[l1_out][NYUGYOKU_SCALAR_DIMS]`) に並べ替えたもの。
+    /// 入玉スカラーなしのネットを広げるワームスタートで使い、新規の初期化と同じ値を足す。
+    pub fn sample_nyugyoku_l1_w_out_major(&self, l1_out: usize) -> Vec<f32> {
+        let in_major = self.sample_nyugyoku_l1_w_in_major(l1_out);
+        let mut out = vec![0.0_f32; in_major.len()];
+        for k in 0..NYUGYOKU_SCALAR_DIMS {
+            for o in 0..l1_out {
+                out[o * NYUGYOKU_SCALAR_DIMS + k] = in_major[k * l1_out + o];
+            }
+        }
+        out
+    }
+
+    /// 入玉スカラーの列の L1 weight のノイズの半値幅を設定する。0 なら厳密に 0 で始める。
+    pub fn set_nyugyoku_init_noise(&mut self, half_width: f32) -> Result<(), String> {
+        if !half_width.is_finite() || half_width < 0.0 {
+            return Err(format!(
+                "--nyugyoku-init-noise must be a finite value >= 0 (got {half_width})"
+            ));
+        }
+        self.l1_w_nyugyoku = nyugyoku_l1_noise(half_width);
+        Ok(())
     }
 
     /// CLI override (重み側のみ) を該当 group に適用する。L1 shared は Simple に存在しない。
@@ -323,6 +383,14 @@ impl SimpleInit {
         };
         ov.apply(target);
         Ok(())
+    }
+}
+
+fn nyugyoku_l1_noise(half_width: f32) -> LayerInit {
+    if half_width == 0.0 {
+        LayerInit::zeroed()
+    } else {
+        LayerInit::uniform_abs(half_width, DEFAULT_SIMPLE_SEEDS[8])
     }
 }
 
@@ -573,6 +641,47 @@ mod tests {
     fn default_simple_ft_stays_abs() {
         let p = SimpleInit::default_uniform();
         assert_eq!(p.ft_w.scale, Scale::Abs(0.01));
+    }
+
+    #[test]
+    fn nyugyoku_init_noise_sets_half_width_and_allows_zero() {
+        let mut init = SimpleInit::default_uniform();
+        assert_eq!(
+            init.l1_w_nyugyoku,
+            LayerInit::uniform_abs(DEFAULT_NYUGYOKU_INIT_NOISE, DEFAULT_SIMPLE_SEEDS[8])
+        );
+        // 他の group の seed と重ならない (入玉スカラーの列だけ別の乱数列になる)。
+        assert!(!DEFAULT_SIMPLE_SEEDS[..8].contains(&DEFAULT_SIMPLE_SEEDS[8]));
+        init.set_nyugyoku_init_noise(0.25).unwrap();
+        let noise = sample(WeightShape::flat(96 * 32, 96), &init.l1_w_nyugyoku);
+        assert!(noise.iter().all(|x| x.abs() <= 0.25) && noise.iter().any(|&x| x != 0.0));
+        init.set_nyugyoku_init_noise(0.0).unwrap();
+        assert_eq!(init.l1_w_nyugyoku, LayerInit::zeroed());
+        for bad in [-0.1_f32, f32::NAN, f32::INFINITY] {
+            assert!(init.set_nyugyoku_init_noise(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn l1_w_ft_columns_do_not_depend_on_nyugyoku_columns() {
+        let init = SimpleInit::default_uniform();
+        let (ft_dim, l1_out) = (512, 32);
+        let plain = init.sample_l1_w(ft_dim, l1_out, false);
+        let with = init.sample_l1_w(ft_dim, l1_out, true);
+        assert_eq!(plain.len(), ft_dim * l1_out);
+        assert_eq!(with.len(), (ft_dim + NYUGYOKU_SCALAR_DIMS) * l1_out);
+        assert_eq!(with[..plain.len()], plain[..]);
+        let in_major = init.sample_nyugyoku_l1_w_in_major(l1_out);
+        assert_eq!(with[plain.len()..], in_major[..]);
+        let out_major = init.sample_nyugyoku_l1_w_out_major(l1_out);
+        for k in 0..NYUGYOKU_SCALAR_DIMS {
+            for o in 0..l1_out {
+                assert_eq!(
+                    out_major[o * NYUGYOKU_SCALAR_DIMS + k],
+                    in_major[k * l1_out + o]
+                );
+            }
+        }
     }
 
     #[test]

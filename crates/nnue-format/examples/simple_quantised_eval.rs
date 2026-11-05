@@ -6,6 +6,11 @@
 //!     --out /path/to/nn.bin [--nyugyoku-rule csa27] [--nyugyoku-encoding thermometer] \
 //!     [--seed 1] [--fv-scale 16] [--scalar-weight 127]
 //!
+//! # L1 weight の列ブロックごとの L2 ノルム (i8 / 64 の実数値) を出す。入玉スカラーの列が
+//! # 学習で 0 から動いたかを、学習前後の .bin で見比べるのに使う
+//! cargo run -p nnue-format --release --example simple_quantised_eval -- l1-norms \
+//!     --net /path/to/nn.bin [--nyugyoku-rule csa27]
+//!
 //! # SFEN 1 行 1 局面のファイルを評価し、「出力層の生の値<TAB>評価値」を 1 行ずつ出す。
 //! # --stats を付けると、各層で 0 / 127 に張り付いた値の割合を標準エラーに出す
 //! cargo run -p nnue-format --release --example simple_quantised_eval -- eval \
@@ -42,7 +47,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let command = it
         .next()
-        .ok_or("expected a subcommand: random-net or eval")?;
+        .ok_or("expected a subcommand: random-net, eval or l1-norms")?;
     let mut args = Args {
         command,
         out: PathBuf::new(),
@@ -252,11 +257,45 @@ impl Stats {
     }
 }
 
+/// L1 weight を列ブロック (FT の手番側・相手側、入玉スカラーの手番側・相手側の玉と 0 埋めの
+/// 列) に分け、ブロックごとの L2 ノルムを出す。
+fn l1_norms(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let id = net_id(args.nyugyoku);
+    let mut reader = BufReader::new(std::fs::File::open(&args.net)?);
+    let q = SimpleQuantised::read(&mut reader, id)?;
+    let padded = nnue_format::simple_weights::pad32(id.combined_dim());
+    let ft = id.ft_out;
+    let block = shogi_features::nyugyoku_scalar::NYUGYOKU_SCALAR_BLOCK_DIMS;
+    let mut blocks = vec![("ft_stm", 0, ft), ("ft_nstm", ft, 2 * ft)];
+    if id.nyugyoku_scalar.is_some() {
+        // 入玉スカラーは手番側の玉・相手側の玉のブロック (各 44 列) と、残りの 0 埋め 8 列。
+        blocks.push(("scalar_stm", 2 * ft, 2 * ft + block));
+        blocks.push(("scalar_nstm", 2 * ft + block, 2 * ft + 2 * block));
+        blocks.push((
+            "scalar_pad",
+            2 * ft + 2 * block,
+            2 * ft + NYUGYOKU_SCALAR_DIMS,
+        ));
+    }
+    for (name, begin, end) in blocks {
+        let sum: f64 = (0..id.l1_out)
+            .flat_map(|o| q.l1_w[o * padded + begin..o * padded + end].iter())
+            .map(|&w| {
+                let x = f64::from(w) / 64.0;
+                x * x
+            })
+            .sum();
+        println!("{name}\t{:.6}", sum.sqrt());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     match args.command.as_str() {
         "random-net" => random_net(&args),
         "eval" => eval(&args),
+        "l1-norms" => l1_norms(&args),
         other => Err(format!("unknown subcommand {other}").into()),
     }
 }
