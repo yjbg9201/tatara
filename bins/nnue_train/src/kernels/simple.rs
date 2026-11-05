@@ -454,9 +454,11 @@ pub fn dense_bias_grad_tiled(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim:
 /// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +
 /// `slice_scatter_2d` を 1 kernel に融合。`ft_out` に bias を in-place 加算してから (bwd
 /// indicator のため post-bias 値を保持) CReLU 適用結果を直接 `combined` の per-perspective
-/// slice (`dst_offset = 0` for stm / `ft_out_dim` for nstm) に書く。中間 `ft_*_acted`
-/// buffer の DRAM write+read (b × ft_out × 4 byte × 2 traversal) と、`ft_*_out` の
-/// bias_add → crelu 間の DRAM read+write (b × ft_out × 4 byte × 2 traversal) を消す。
+/// slice (`dst_offset = 0` for stm / `ft_out_dim` for nstm、行幅 `combined_stride` =
+/// `combined_dim`) に書く。行の `[2*ft_out_dim, combined_stride)` (密入力の列) は書かない。
+/// 中間 `ft_*_acted` buffer の DRAM write+read (b × ft_out × 4 byte × 2 traversal) と、
+/// `ft_*_out` の bias_add → crelu 間の DRAM read+write (b × ft_out × 4 byte × 2 traversal)
+/// を消す。CPU reference は `gpu_kernels::simple::ft_post` の `*_cpu`。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn simple_ft_post_fused_crelu(
@@ -465,6 +467,7 @@ pub fn simple_ft_post_fused_crelu(
     mut combined: DisjointSlice<f32>,
     batch: u32,
     ft_out_dim: u32,
+    combined_stride: u32,
     dst_offset: u32,
 ) {
     let tid = thread::index_1d();
@@ -491,9 +494,10 @@ pub fn simple_ft_post_fused_crelu(
     } else {
         pre_val
     };
-    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
-    // SAFETY: combined.len() == batch * 2 * ft_out_dim、`dst_offset + oi < 2*ft_out_dim`
-    // (caller が 0 or ft_out_dim を渡す)、bi < batch、disjoint write per (bi, oi)。
+    let combined_idx = bi * (combined_stride as usize) + (dst_offset as usize) + oi;
+    // SAFETY: combined.len() >= batch * combined_stride、`dst_offset + oi < 2*ft_out_dim <=
+    // combined_stride` (caller が dst_offset に 0 or ft_out_dim を渡し、combined_stride に
+    // combined_dim を渡す)、bi < batch、disjoint write per (bi, oi)。
     unsafe {
         *combined.get_unchecked_mut(combined_idx) = acted;
     }
@@ -510,6 +514,7 @@ pub fn simple_ft_post_fused_screlu(
     mut combined: DisjointSlice<f32>,
     batch: u32,
     ft_out_dim: u32,
+    combined_stride: u32,
     dst_offset: u32,
 ) {
     let tid = thread::index_1d();
@@ -536,7 +541,7 @@ pub fn simple_ft_post_fused_screlu(
         pre_val
     };
     let acted = a * a;
-    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
+    let combined_idx = bi * (combined_stride as usize) + (dst_offset as usize) + oi;
     // SAFETY: 同 [`simple_ft_post_fused_crelu`]。
     unsafe {
         *combined.get_unchecked_mut(combined_idx) = acted;
@@ -549,7 +554,8 @@ pub fn simple_ft_post_fused_screlu(
 /// `dft_out` に直接書く。非融合の 2 kernel が要する中間 `dft_*_acted` buffer の
 /// DRAM round-trip (b × ft_out × 4 byte の write+read) を省く。
 ///
-/// `src_offset` で stm (= 0) / nstm (= ft_out) を選択する。
+/// `src_offset` で stm (= 0) / nstm (= ft_out) を選択する。`combined_stride` は `dcombined`
+/// の行幅 (`combined_dim`)。行の `[2*ft_out, combined_stride)` (密入力の列の勾配) は読まない。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn simple_bwd_ft_act_crelu_fused(
@@ -558,6 +564,7 @@ pub fn simple_bwd_ft_act_crelu_fused(
     dft_out: &[f32],
     batch: u32,
     ft_out: u32,
+    combined_stride: u32,
     src_offset: u32,
 ) {
     let tid = thread::index_1d();
@@ -568,8 +575,7 @@ pub fn simple_bwd_ft_act_crelu_fused(
     }
     let bi = tid.get() / ft_out_u;
     let oi = tid.get() % ft_out_u;
-    let l1_in = 2 * ft_out_u;
-    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dcomb_idx = bi * (combined_stride as usize) + (src_offset as usize) + oi;
     let dft_acted = dcombined[dcomb_idx];
     let xi = ft_pre_act[tid.get()];
     let g = if xi > 0.0_f32 && xi < 1.0_f32 {
@@ -596,6 +602,7 @@ pub fn simple_bwd_ft_act_screlu_fused(
     dft_out: &[f32],
     batch: u32,
     ft_out: u32,
+    combined_stride: u32,
     src_offset: u32,
 ) {
     let tid = thread::index_1d();
@@ -606,8 +613,7 @@ pub fn simple_bwd_ft_act_screlu_fused(
     }
     let bi = tid.get() / ft_out_u;
     let oi = tid.get() % ft_out_u;
-    let l1_in = 2 * ft_out_u;
-    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dcomb_idx = bi * (combined_stride as usize) + (src_offset as usize) + oi;
     let dft_acted = dcombined[dcomb_idx];
     let xi = ft_pre_act[tid.get()];
     #[allow(clippy::manual_clamp)]
@@ -628,5 +634,39 @@ pub fn simple_bwd_ft_act_screlu_fused(
     unsafe {
         let p = dft_out.as_ptr().add(tid.get()) as *mut f32;
         p.write(g);
+    }
+}
+
+/// 入玉スカラー (u8、`batch × scalar_dim`、127 が 1.0) を `combined` の各行の
+/// `[col_offset, col_offset + scalar_dim)` に `u8 / 127` の f32 で書く。FP32 / FP16 どちらの
+/// FT 経路でも FT post の後に呼ぶ (`combined` は常に f32)。入力は学習データの定数で、
+/// 対応する backward kernel は無い (`dcombined` の同じ列は誰も読まない)。
+///
+/// 1 thread = 1 (batch, k) cell、atomic 不要。CPU reference は
+/// `gpu_kernels::simple::dense_input::simple_nyugyoku_scalar_to_combined_cpu`。
+#[kernel]
+pub fn simple_nyugyoku_scalar_to_combined(
+    scalars: &[u8],
+    mut combined: DisjointSlice<f32>,
+    combined_stride: u32,
+    col_offset: u32,
+    batch: u32,
+    scalar_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let dim = scalar_dim as usize;
+    let total = (batch as usize) * dim;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / dim;
+    let k = tid.get() % dim;
+    let value = scalars[tid.get()] as f32 / 127.0_f32;
+    let idx = bi * (combined_stride as usize) + (col_offset as usize) + k;
+    // SAFETY: 各 thread が unique (bi, k) → unique idx に書く。host が `col_offset + scalar_dim
+    // <= combined_stride` と `combined.len() >= batch * combined_stride` を保証する
+    // (`SimpleGpuTrainer` は `col_offset = 2*ft_out`、`combined_stride = combined_dim`)。
+    unsafe {
+        *combined.get_unchecked_mut(idx) = value;
     }
 }

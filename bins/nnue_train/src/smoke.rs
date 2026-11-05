@@ -268,6 +268,8 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    nyugyoku_scalar_smoke(&ctx, primary_loss)?;
+
     if native_scope {
         println!(
             "[smoke/simple] PASSED — native factorized FP16 CReLU/default-WRM forward + \
@@ -414,6 +416,93 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "[smoke/simple] PASSED — forward + gradient + quantised round-trip + raw round-trip OK"
     );
+    Ok(())
+}
+
+/// 入玉スカラーつきの Simple (HalfKP 256x2-32-32、L1 入力 608、FP32) の smoke。入玉スカラーの
+/// 列の L1 weight を 0 で始め、forward が finite・10 step で loss が下がる・入玉スカラーの列の
+/// weight が 0 から動く・量子化 round-trip 後の forward が finite、を確認する。
+fn nyugyoku_scalar_smoke(
+    ctx: &std::sync::Arc<CudaContext>,
+    loss: nnue_train::trainer::LossKind,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = shogi_features::NyugyokuScalarConfig::default();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+        nyugyoku_scalar: Some(config),
+    };
+    let mut init = SimpleInit::default_uniform();
+    init.set_nyugyoku_init_noise(0.0)?;
+    let mut trainer = SimpleGpuTrainer::new(
+        ctx,
+        SMOKE_BATCH,
+        id,
+        OptimizerKind::Ranger,
+        1e-7,
+        None,
+        16,
+        PrecisionFlags::default(),
+        &init,
+    )?;
+    trainer.sync_ft_forward_weights()?;
+    let mut batch =
+        BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set).with_dummy_nyugyoku_scalars(config);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+    let ft_rows = id.ft_output_dim() * id.l1_out;
+    let scalar_norm = |trainer: &SimpleGpuTrainer| -> Result<f32, Box<dyn std::error::Error>> {
+        let l1 = trainer.l1_w_to_host()?;
+        Ok(l1[ft_rows..].iter().map(|w| w * w).sum::<f32>().sqrt())
+    };
+    let initial_norm = scalar_norm(&trainer)?;
+    let initial_loss = trainer.forward(&batch.as_ref(), 0.0, loss)?;
+    for step_idx in 0..10 {
+        let step_loss = trainer.step(&batch.as_ref(), 1e-3, 0.0, loss)?;
+        if !step_loss.is_finite() {
+            return Err(
+                format!("nyugyoku step {step_idx} loss = {step_loss} is not finite").into(),
+            );
+        }
+    }
+    trainer.assert_all_weights_finite()?;
+    let final_loss = trainer.forward(&batch.as_ref(), 0.0, loss)?;
+    let final_norm = scalar_norm(&trainer)?;
+    println!(
+        "[smoke/simple] entering-king scalars (L1 input {}): loss {initial_loss:.6e} -> \
+         {final_loss:.6e}, scalar-column L1 weight norm {initial_norm:.3e} -> {final_norm:.3e}",
+        id.combined_dim()
+    );
+    if !final_loss.is_finite() || final_loss >= initial_loss {
+        return Err(format!(
+            "entering-king scalar training did not decrease loss: initial = {initial_loss}, \
+             final = {final_loss}"
+        )
+        .into());
+    }
+    if initial_norm != 0.0 || final_norm <= 0.0 {
+        return Err(format!(
+            "scalar-column L1 weights should start at 0 and move (norm {initial_norm} -> \
+             {final_norm})"
+        )
+        .into());
+    }
+    let weights = trainer.to_simple_weights()?;
+    let mut bytes = Vec::new();
+    weights.save_quantised(&mut bytes)?;
+    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&bytes), id)?;
+    trainer.load_simple_weights(&reloaded)?;
+    trainer.sync_ft_forward_weights()?;
+    let loss_q = trainer.forward(&batch.as_ref(), 0.0, loss)?;
+    if !loss_q.is_finite() {
+        return Err(
+            format!("entering-king scalar round-trip loss = {loss_q} is not finite").into(),
+        );
+    }
+    println!("[smoke/simple] entering-king scalars OK ✓ (quantised round-trip loss {loss_q:.6e})");
     Ok(())
 }
 

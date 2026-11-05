@@ -45,6 +45,11 @@ use gpu_kernels::pointwise::norm_loss::{norm_loss_apply_cpu, norm_loss_compute_n
 use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_step_cpu};
 use gpu_kernels::pointwise::ranger_step::{ranger_lookahead_lerp_cpu, ranger_step_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
+use gpu_kernels::simple::dense_input::simple_nyugyoku_scalar_to_combined_cpu;
+use gpu_kernels::simple::ft_post::{
+    simple_bwd_ft_act_crelu_fused_cpu, simple_bwd_ft_act_screlu_fused_cpu,
+    simple_ft_post_fused_crelu_cpu, simple_ft_post_fused_screlu_cpu,
+};
 use gpu_kernels::sparse::ft_factorize::{
     FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
     FtFactorizeLayout, ft_fold_virtual_cpu, ft_reduce_virtual_grad_cpu,
@@ -6658,5 +6663,180 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
             "l3_b m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1^6) ratio"
         );
     }
+    Ok(())
+}
+
+// ---- 入玉スカラーつきの Simple (combined の行幅 = 2*ft_out + 96) ----
+
+/// 入玉スカラー 96 列を足した `combined` の行幅で使う FT 幅と batch。
+const SCALAR_TEST_FT: usize = 256;
+const SCALAR_TEST_DIMS: usize = 96;
+const SCALAR_TEST_STRIDE: usize = 2 * SCALAR_TEST_FT + SCALAR_TEST_DIMS;
+const SCALAR_TEST_BATCH: usize = 5;
+
+/// FP32 の FT post 融合 kernel が行幅 `2*ft_out + 96` で CPU reference と一致し、行末の
+/// 入玉スカラーの列 (事前に置いた番兵) を書き換えない。
+#[test]
+fn simple_ft_post_fused_with_scalar_columns_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_ctx, module, stream) = open_module()?;
+    let (b, ft, stride) = (SCALAR_TEST_BATCH, SCALAR_TEST_FT, SCALAR_TEST_STRIDE);
+    let bias = deterministic_floats(ft, 2.0);
+    let sentinel = -9.25_f32;
+    for screlu in [false, true] {
+        let stm = deterministic_floats(b * ft, 3.0);
+        let nstm = deterministic_floats(b * ft, 5.0);
+        let (mut stm_cpu, mut nstm_cpu) = (stm.clone(), nstm.clone());
+        let mut combined_cpu = vec![sentinel; b * stride];
+        let cpu = if screlu {
+            simple_ft_post_fused_screlu_cpu
+        } else {
+            simple_ft_post_fused_crelu_cpu
+        };
+        cpu(&mut stm_cpu, &bias, &mut combined_cpu, b, ft, stride, 0);
+        cpu(&mut nstm_cpu, &bias, &mut combined_cpu, b, ft, stride, ft);
+
+        let mut stm_dev = DeviceBuffer::from_host(&stream, &stm)?;
+        let mut nstm_dev = DeviceBuffer::from_host(&stream, &nstm)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let mut combined_dev = DeviceBuffer::from_host(&stream, &vec![sentinel; b * stride])?;
+        for (ft_dev, offset) in [(&mut stm_dev, 0_u32), (&mut nstm_dev, ft as u32)] {
+            if screlu {
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: simple_ft_post_fused_screlu, stream: stream, module: module,
+                        config: cfg_1d(b * ft),
+                        args: [slice_mut(*ft_dev), slice(bias_dev), slice_mut(combined_dev),
+                               b as u32, ft as u32, stride as u32, offset]
+                    }
+                }?;
+            } else {
+                unsafe {
+                    // SAFETY: 同上。
+                    cuda_launch! {
+                        kernel: simple_ft_post_fused_crelu, stream: stream, module: module,
+                        config: cfg_1d(b * ft),
+                        args: [slice_mut(*ft_dev), slice(bias_dev), slice_mut(combined_dev),
+                               b as u32, ft as u32, stride as u32, offset]
+                    }
+                }?;
+            }
+        }
+        stream.synchronize()?;
+        let label = if screlu { "screlu" } else { "crelu" };
+        assert_close(label, &stm_dev.to_host_vec(&stream)?, &stm_cpu, TOL);
+        assert_close(label, &nstm_dev.to_host_vec(&stream)?, &nstm_cpu, TOL);
+        let combined = combined_dev.to_host_vec(&stream)?;
+        assert_close(label, &combined, &combined_cpu, TOL);
+        for bi in 0..b {
+            assert!(
+                combined[bi * stride + 2 * ft..(bi + 1) * stride]
+                    .iter()
+                    .all(|&v| v == sentinel),
+                "{label}: scalar columns of row {bi} were overwritten"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// FP32 の FT activation backward 融合 kernel が行幅 `2*ft_out + 96` の `dcombined` で
+/// CPU reference と一致し、入玉スカラーの列 (NaN を置く) を読まない。
+#[test]
+fn simple_bwd_ft_act_fused_with_scalar_columns_matches_cpu()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (b, ft, stride) = (SCALAR_TEST_BATCH, SCALAR_TEST_FT, SCALAR_TEST_STRIDE);
+    let pre = deterministic_floats(b * ft, 7.0);
+    let mut dcombined = deterministic_floats(b * stride, 11.0);
+    for bi in 0..b {
+        for v in &mut dcombined[bi * stride + 2 * ft..(bi + 1) * stride] {
+            *v = f32::NAN;
+        }
+    }
+    let dcombined_dev = DeviceBuffer::from_host(&stream, &dcombined)?;
+    let pre_dev = DeviceBuffer::from_host(&stream, &pre)?;
+    for screlu in [false, true] {
+        for offset in [0, ft] {
+            let mut dft_cpu = vec![0.0_f32; b * ft];
+            let cpu = if screlu {
+                simple_bwd_ft_act_screlu_fused_cpu
+            } else {
+                simple_bwd_ft_act_crelu_fused_cpu
+            };
+            cpu(&dcombined, &pre, &mut dft_cpu, b, ft, stride, offset);
+            let dft_dev = DeviceBuffer::<f32>::zeroed(&stream, b * ft)?;
+            if screlu {
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: simple_bwd_ft_act_screlu_fused, stream: stream, module: module,
+                        config: cfg_1d(b * ft),
+                        args: [slice(dcombined_dev), slice(pre_dev), slice(dft_dev),
+                               b as u32, ft as u32, stride as u32, offset as u32]
+                    }
+                }?;
+            } else {
+                unsafe {
+                    // SAFETY: 同上。
+                    cuda_launch! {
+                        kernel: simple_bwd_ft_act_crelu_fused, stream: stream, module: module,
+                        config: cfg_1d(b * ft),
+                        args: [slice(dcombined_dev), slice(pre_dev), slice(dft_dev),
+                               b as u32, ft as u32, stride as u32, offset as u32]
+                    }
+                }?;
+            }
+            stream.synchronize()?;
+            let dft = dft_dev.to_host_vec(&stream)?;
+            assert!(
+                dft.iter().all(|v| !v.is_nan()),
+                "scalar-column gradients leaked"
+            );
+            assert_close("simple_bwd_ft_act_fused", &dft, &dft_cpu, TOL);
+        }
+    }
+    Ok(())
+}
+
+/// 入玉スカラーを `combined` に書く kernel が CPU reference と bit 単位で一致し、FT の列
+/// (番兵) を書き換えない。
+#[test]
+fn simple_nyugyoku_scalar_to_combined_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (b, ft, dims, stride) = (
+        SCALAR_TEST_BATCH,
+        SCALAR_TEST_FT,
+        SCALAR_TEST_DIMS,
+        SCALAR_TEST_STRIDE,
+    );
+    let scalars: Vec<u8> = (0..b * dims).map(|i| (i * 37 % 128) as u8).collect();
+    let sentinel = 3.5_f32;
+    let mut combined_cpu = vec![sentinel; b * stride];
+    simple_nyugyoku_scalar_to_combined_cpu(&scalars, &mut combined_cpu, b, dims, stride, 2 * ft);
+    let scalars_dev = DeviceBuffer::from_host(&stream, &scalars)?;
+    let mut combined_dev = DeviceBuffer::from_host(&stream, &vec![sentinel; b * stride])?;
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: simple_nyugyoku_scalar_to_combined, stream: stream, module: module,
+            config: cfg_1d(b * dims),
+            args: [slice(scalars_dev), slice_mut(combined_dev),
+                   stride as u32, (2 * ft) as u32, b as u32, dims as u32]
+        }
+    }?;
+    stream.synchronize()?;
+    let combined = combined_dev.to_host_vec(&stream)?;
+    assert!(
+        combined
+            .iter()
+            .zip(&combined_cpu)
+            .all(|(g, c)| g.to_bits() == c.to_bits()),
+        "simple_nyugyoku_scalar_to_combined differs from the CPU reference"
+    );
     Ok(())
 }

@@ -1392,8 +1392,9 @@ pub(crate) struct SimpleArgs {
     /// Concatenate the 96 entering-king (nyugyoku) scalar inputs to the L1 input after the FT
     /// output, computed with this declaration rule: "csa27" (CSA rule, 28 points for Black and
     /// 27 for White) or "csa24" (31 points for both). The rule is fixed in the exported net and
-    /// recorded in its hash and architecture string. Requires --activation crelu. Training such
-    /// a net on the GPU is not supported yet.
+    /// recorded in its hash and architecture string. Requires --activation crelu. With
+    /// --init-from, a net with the same layers but without these inputs is also accepted and
+    /// widened (the new L1 columns start from --nyugyoku-init-noise).
     #[arg(long)]
     pub(crate) nyugyoku_rule: Option<String>,
 
@@ -1401,6 +1402,12 @@ pub(crate) struct SimpleArgs {
     /// valid together with --nyugyoku-rule.
     #[arg(long)]
     pub(crate) nyugyoku_encoding: Option<String>,
+
+    /// Half-width of the uniform noise for the initial L1 weights of the entering-king scalar
+    /// columns (default 0.001). 0 starts them at exactly 0, so a net widened from --init-from
+    /// computes the same values as the original. Only valid together with --nyugyoku-rule.
+    #[arg(long)]
+    pub(crate) nyugyoku_init_noise: Option<f32>,
 
     /// Also keep the FT activation (the `ft_*_out` forward output and the
     /// `dft_*_out` backward gradient) in FP16. Requires the global `--ft-fp16`

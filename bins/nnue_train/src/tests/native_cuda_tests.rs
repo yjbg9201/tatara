@@ -3945,3 +3945,296 @@ fn fused_ft_norms_follow_external_weight_writes() -> Result<(), Box<dyn std::err
     assert_same_weights("after resume", &fused, &separate)?;
     Ok(())
 }
+
+// ---- 入玉スカラーつきの Simple (L1 入力 = 2*ft_out + 96) ----
+
+fn nyugyoku_id(scalar: bool) -> SimpleId {
+    SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+        nyugyoku_scalar: scalar.then(shogi_features::NyugyokuScalarConfig::default),
+    }
+}
+
+/// `init` を指定して native backend の Simple trainer を作る (`create_trainer_with_options` と
+/// 同じく forward 用 weight を同期してから返す)。
+fn create_nyugyoku_trainer(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    precision: PrecisionFlags,
+    init: &SimpleInit,
+) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
+    let build = || {
+        SimpleGpuTrainer::new(
+            context,
+            SMOKE_BATCH,
+            id,
+            OptimizerKind::Ranger,
+            0.0,
+            None,
+            16,
+            precision,
+            init,
+        )
+    };
+    #[cfg(feature = "oxide-parity")]
+    let mut trainer = with_test_native_backend(true, build)?;
+    #[cfg(feature = "native")]
+    let mut trainer = build()?;
+    trainer.sync_ft_forward_weights()?;
+    Ok(trainer)
+}
+
+fn nyugyoku_batch(id: SimpleId) -> crate::trainer_common::BatchDataOwned {
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch
+        .score
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, s)| *s = -300.0 + 47.0 * i as f32);
+    batch
+        .wdl
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, w)| *w = [0.0, 0.5, 1.0][i % 3]);
+    match id.nyugyoku_scalar {
+        Some(config) => batch.with_dummy_nyugyoku_scalars(config),
+        None => batch,
+    }
+}
+
+/// `SimpleWeights` (out-major) と batch の index / 入玉スカラーから、CReLU の Simple を f32 で
+/// そのまま計算した出力層の値 (trainer の `net_output` と同じ量)。
+fn simple_crelu_forward_cpu(
+    w: &nnue_format::SimpleWeights,
+    batch: &crate::trainer_common::BatchDataOwned,
+) -> Vec<f32> {
+    let id = w.id;
+    let (ft_out, l1_in) = (id.ft_out, id.combined_dim());
+    let max_active = id.feature_set.max_active();
+    let crelu = |x: f32| x.clamp(0.0, 1.0);
+    let dense = |weights: &[f32], bias: &[f32], x: &[f32]| -> Vec<f32> {
+        bias.iter()
+            .enumerate()
+            .map(|(o, &b)| {
+                b + weights[o * x.len()..(o + 1) * x.len()]
+                    .iter()
+                    .zip(x)
+                    .map(|(w, x)| w * x)
+                    .sum::<f32>()
+            })
+            .collect()
+    };
+    (0..batch.n_pos)
+        .map(|bi| {
+            let mut x = Vec::with_capacity(l1_in);
+            for indices in [&batch.stm_indices, &batch.nstm_indices] {
+                let mut acc = w.ft_b.clone();
+                for &f in &indices[bi * max_active..(bi + 1) * max_active] {
+                    if f >= 0 {
+                        let row = &w.ft_w[f as usize * ft_out..(f as usize + 1) * ft_out];
+                        acc.iter_mut().zip(row).for_each(|(a, r)| *a += r);
+                    }
+                }
+                x.extend(acc.into_iter().map(crelu));
+            }
+            if id.nyugyoku_scalar.is_some() {
+                let dims = shogi_features::NYUGYOKU_SCALAR_DIMS;
+                x.extend(
+                    batch.nyugyoku_scalars[bi * dims..(bi + 1) * dims]
+                        .iter()
+                        .map(|&q| f32::from(q) / 127.0),
+                );
+            }
+            let h1: Vec<f32> = dense(&w.l1_w, &w.l1_b, &x).into_iter().map(crelu).collect();
+            let h2: Vec<f32> = dense(&w.l2_w, &w.l2_b, &h1)
+                .into_iter()
+                .map(crelu)
+                .collect();
+            dense(&w.l3_w, &w.l3_b, &h2)[0]
+        })
+        .collect()
+}
+
+/// 入玉スカラーの列に大きめの weight を入れた trainer の forward (FP32 と `--ft-fp16-out`
+/// 経路) が、同じ weight から f32 で計算した値と一致する。入玉スカラーが L1 入力の行末
+/// `[2*ft_out, combined_dim)` に u8 / 127 で入り、FT の列を壊さないことを見る。
+#[test]
+fn simple_nyugyoku_forward_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let id = nyugyoku_id(true);
+    let batch = nyugyoku_batch(id);
+    for (precision, tolerance) in [
+        (PrecisionFlags::default(), 1.0e-4_f32),
+        (
+            PrecisionFlags {
+                ft_fp16: true,
+                ft_fp16_out: true,
+                ..PrecisionFlags::default()
+            },
+            2.0e-2,
+        ),
+    ] {
+        let mut trainer =
+            create_nyugyoku_trainer(&context, id, precision, &SimpleInit::default_uniform())?;
+        let mut weights = trainer.to_simple_weights()?;
+        // 入玉スカラーの列の weight を ±0.5 にし、出力に効くようにする。
+        let ft_dim = id.ft_output_dim();
+        for o in 0..id.l1_out {
+            for k in 0..shogi_features::NYUGYOKU_SCALAR_DIMS {
+                weights.l1_w[o * id.combined_dim() + ft_dim + k] =
+                    if (o + k) % 3 == 0 { 0.5 } else { -0.25 };
+            }
+        }
+        trainer.load_simple_weights(&weights)?;
+        trainer.sync_ft_forward_weights()?;
+        let gpu = trainer
+            .validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?
+            .net_output;
+        let cpu = simple_crelu_forward_cpu(&weights, &batch);
+        for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+            assert!(
+                (g - c).abs() <= tolerance * c.abs().max(1.0),
+                "fp16_out={} position {i}: gpu {g} cpu {c}",
+                precision.ft_fp16_out
+            );
+        }
+        // 入玉スカラーを全て 0 にすると出力が変わる (スカラーの列が使われている)。
+        let mut zeroed = nyugyoku_batch(id);
+        zeroed.nyugyoku_scalars.fill(0);
+        let without = trainer
+            .validate(&zeroed.as_ref(), 0.0, SMOKE_LOSS_WRM)?
+            .net_output;
+        assert_outputs_differ(&gpu, &without, "entering-king scalars");
+    }
+    Ok(())
+}
+
+/// 入玉スカラーなしのネットを、入玉スカラーの列の weight 0 で広げて読み込んだ trainer は、
+/// 元のネットを読み込んだ入玉スカラーなしの trainer と同じ出力を返す (ワームスタート直後の
+/// 関数保存)。
+#[test]
+fn simple_nyugyoku_warm_start_keeps_outputs() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let (plain_id, scalar_id) = (nyugyoku_id(false), nyugyoku_id(true));
+    let init = SimpleInit::default_uniform();
+    let mut plain = create_nyugyoku_trainer(&context, plain_id, PrecisionFlags::default(), &init)?;
+    // 学習済みに近い weight にするため数 step 進めてから書き出す。
+    let plain_batch = nyugyoku_batch(plain_id);
+    for _ in 0..5 {
+        let _ = plain.step(&plain_batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    }
+    let original = plain.to_simple_weights()?;
+    let mut bytes = Vec::new();
+    original.save_quantised(&mut bytes)?;
+    let quantised = nnue_format::SimpleWeights::load(&mut bytes.as_slice(), plain_id)?;
+    plain.load_simple_weights(&quantised)?;
+    plain.sync_ft_forward_weights()?;
+
+    let (widened, was_widened) =
+        nnue_format::SimpleWeights::load_for_init(&mut bytes.as_slice(), scalar_id, || {
+            vec![0.0; scalar_id.l1_out * shogi_features::NYUGYOKU_SCALAR_DIMS]
+        })?;
+    assert!(was_widened);
+    let mut scalar =
+        create_nyugyoku_trainer(&context, scalar_id, PrecisionFlags::default(), &init)?;
+    scalar.load_simple_weights(&widened)?;
+    scalar.sync_ft_forward_weights()?;
+
+    let scalar_batch = nyugyoku_batch(scalar_id);
+    let a = plain.validate(&plain_batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    let b = scalar.validate(&scalar_batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    for (i, (x, y)) in a.net_output.iter().zip(&b.net_output).enumerate() {
+        assert!(
+            (x - y).abs() <= 1.0e-5 * x.abs().max(1.0),
+            "position {i}: original {x} widened {y}"
+        );
+    }
+    let rel = (a.loss - b.loss).abs() / a.loss.abs().max(1.0e-12);
+    assert!(rel <= 1.0e-5, "loss original {} widened {}", a.loss, b.loss);
+    Ok(())
+}
+
+/// 入玉スカラーの列を 0 で始めた trainer は、FT の列の L1 初期値が入玉スカラーなしの構成と
+/// bit 単位で同じで、数十 step の学習で loss が下がり、入玉スカラーの列の L1 weight が
+/// 0 から動く (L1 の backward が入玉スカラーの列の weight 勾配を求める)。
+#[test]
+fn simple_nyugyoku_training_moves_scalar_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let mut init = SimpleInit::default_uniform();
+    init.set_nyugyoku_init_noise(0.0)?;
+    let (plain_id, scalar_id) = (nyugyoku_id(false), nyugyoku_id(true));
+    let plain = create_nyugyoku_trainer(&context, plain_id, PrecisionFlags::default(), &init)?;
+    let mut trainer =
+        create_nyugyoku_trainer(&context, scalar_id, PrecisionFlags::default(), &init)?;
+    let l1_out = scalar_id.l1_out;
+    let ft_rows = scalar_id.ft_output_dim() * l1_out;
+    let plain_l1 = plain.l1_w_to_host()?;
+    let initial_l1 = trainer.l1_w_to_host()?; // in-major: FT 行の後ろに入玉スカラーの 96 行
+    assert_eq!(initial_l1[..ft_rows], plain_l1[..]);
+    assert!(initial_l1[ft_rows..].iter().all(|&w| w == 0.0));
+    drop(plain);
+
+    let batch = nyugyoku_batch(scalar_id);
+    let mut losses = Vec::new();
+    for _ in 0..40 {
+        losses.push(trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?);
+    }
+    losses.push(nnue_train::trainer::TrainerBackend::flush_pending_loss(
+        &mut trainer,
+    )?);
+    trainer.assert_all_weights_finite()?;
+    // step の戻り値は 1 step 遅れ (先頭は 0.0)。
+    let (first, last) = (losses[1], *losses.last().unwrap());
+    assert!(
+        last < first,
+        "loss did not decrease: first {first} last {last}"
+    );
+    let l1 = trainer.l1_w_to_host()?;
+    let norm = |v: &[f32]| v.iter().map(|w| w * w).sum::<f32>().sqrt();
+    assert!(
+        norm(&l1[ft_rows..]) > 0.0,
+        "scalar-column L1 weights stayed at zero"
+    );
+    Ok(())
+}
+
+/// 入玉スカラーつきの Simple の学習 step が、CUDA C++ と cuda-oxide の kernel で同じ結果に
+/// なる (行幅を引数にした FT post / backward と入玉スカラーの書き込み kernel の両実装)。
+#[test]
+#[cfg(feature = "oxide-parity")]
+fn simple_nyugyoku_native_matches_cuda_oxide() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let id = nyugyoku_id(true);
+    let batch = nyugyoku_batch(id);
+    let mut l1 = Vec::new();
+    for native in [false, true] {
+        let mut trainer = with_test_native_backend(native, || {
+            SimpleGpuTrainer::new(
+                &context,
+                SMOKE_BATCH,
+                id,
+                OptimizerKind::Ranger,
+                0.0,
+                None,
+                16,
+                PrecisionFlags::default(),
+                &SimpleInit::default_uniform(),
+            )
+        })?;
+        for _ in 0..3 {
+            let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        }
+        l1.push(trainer.l1_w_to_host()?);
+    }
+    for (i, (a, b)) in l1[0].iter().zip(&l1[1]).enumerate() {
+        assert!(
+            (a - b).abs() <= NATIVE_WEIGHT_ABS_TOLERANCE.max(1.0e-6 * a.abs()),
+            "l1_w[{i}]: oxide {a} native {b}"
+        );
+    }
+    Ok(())
+}
