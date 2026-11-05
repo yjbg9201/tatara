@@ -301,6 +301,7 @@ NyugyokuScalar[96]（手番順、u8 0〜127）──┐
    - 既存ネットからのワームスタート（`--init-from`）はハッシュ照合が厳密なので、スカラー無しのネットを読んで `l1_w` の列を拡張する経路を足す
    - 初期化: スカラー列の L1 重みは 0＋微小ノイズ。既存 HalfKP ネットからのワームスタート時に関数保存になることをテストで確認
    - smoke: 数 superbatch で loss が減ること、スカラー列の重みのノルムが 0 から動くこと
+   - 実装（段階4、GPU 未検証）: 4本の融合カーネルには既存の `*_cpu` 参照実装が無かったので（実ソースとの差異）、`gpu_kernels::simple` に行幅つきの参照実装を新設し、行幅 = `2*ft_out` で融合前のカーネル列（bias 加算 → 活性化 → `slice_scatter_2d` / `slice_extract_2d` → 活性化の勾配）と一致することを CPU テストで確認した。ノイズの大きさは `simple --nyugyoku-init-noise`（既定 0.001、0 可）。結果と判断は tatara `docs/adr-nyugyoku-scalar-input.md` §10、手元での GPU 検証の手順は tatara `docs/nnue-nyugyoku-scalar-gpu-runbook.md`
 5. **export と推論**（T・Y。**段階4より先に実施**）
    - T: L1 入力次元のデータ定義を先に入れる（`SimpleId` に密入力の種別を足し、`combined_dim()` を 2×FT幅＋96 にする。`SimpleWeights` の `l1_w` 列数・ハッシュ・arch 文字列も追従させる）。GPU trainer はこの段階では密入力つきの構成を拒否してよい
    - T・Y: 乱数の重みで export した `.bin` を使い、T の量子化 CPU forward と Y の `Evaluate()` を integer-exact で突合する（学習済みネットを待たずに検証を完了する）
@@ -508,6 +509,7 @@ FT出力512 ─→ 本線 32-32-1 (eval)      loss = 通常のeval/勝敗混合
     - 段階5: `run_simple_training` の `--nyugyoku-rule` の解釈と拒否、`SimpleId` の初期化、`TrainingConfig::nyugyoku_scalar`（`training.rs`）、`SimpleGpuTrainer::new` の拒否（`trainer_simple.rs`）、GPU 限定のテスト・smoke・bench の `SimpleId` リテラルへの `nyugyoku_scalar: None` 追加（`smoke.rs`、`native_bench.rs`、`tests/gpu_cpu_equivalence_tests.rs`、`tests/native_cuda_tests.rs`）
   - [ ] `bash scripts/local-ci.sh` が全 crate で PASS（tatara の push 前規約）
   - [ ] 段階4の GPU/CPU 同等性・smoke・ワームスタートの関数保存（段階4の項を参照）
+  - 手順は tatara の `docs/nnue-nyugyoku-scalar-gpu-runbook.md`（各項目に対応する手順の番号は同文書 §9）。段階4の GPU 限定コードは対象に含まれる: 4本の融合カーネルの行幅（`native_kernels.cu` と `kernels/simple.rs`）、`simple_nyugyoku_scalar_to_combined`、`InputUploadRing` の u8 経路、`SimpleGpuTrainer` の入玉スカラーの入力・初期化、`--init-from` の拡張経路、smoke の入玉スカラーの段
 - 本番学習の GPU は別途検討（T1000 では batch とネット幅の制約が大きい）
 
 ---
