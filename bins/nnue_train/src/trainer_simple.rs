@@ -407,6 +407,14 @@ impl SimpleGpuTrainer {
         if precision.ft_fp16_out && !precision.ft_fp16 {
             return Err("--ft-fp16-out requires --ft-fp16".into());
         }
+        // FP32 の FT post 融合カーネルは `combined` の行幅を `2 * ft_out` と仮定しており、
+        // 入玉スカラーの列を足した L1 入力には未対応。
+        if id.nyugyoku_scalar.is_some() {
+            return Err(
+                "SimpleGpuTrainer: entering-king scalar inputs are not supported by the GPU trainer yet"
+                    .into(),
+            );
+        }
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;

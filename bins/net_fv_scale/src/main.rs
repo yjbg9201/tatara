@@ -577,6 +577,7 @@ mod tests {
             ft_out: TEST_FT_OUT,
             l1_out: TEST_L1_OUT,
             l2_out: TEST_L2_OUT,
+            nyugyoku_scalar: None,
         };
         let net = SimpleWeights::zeroed(id, 7);
         let mut input = Vec::new();

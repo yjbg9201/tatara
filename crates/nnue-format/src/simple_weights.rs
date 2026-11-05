@@ -8,9 +8,11 @@
 //!
 //! - FT: `ft_in → ft_out`、weight + bias 共有 stm/nstm (`ft_in` は feature set 依存、
 //!   `ft_out` は CLI 設定値)
-//! - per-perspective FT post 活性化 → `concat(stm, nstm)` = `l1_in`。CReLU / SCReLU は
-//!   elementwise で `l1_in = 2*ft_out`、Pairwise は前半×後半の積で 1 perspective が
-//!   半減し `l1_in = ft_out`
+//! - per-perspective FT post 活性化 → `concat(stm, nstm)`。CReLU / SCReLU は
+//!   elementwise で `2*ft_out`、Pairwise は前半×後半の積で 1 perspective が半減し `ft_out`
+//! - 入玉スカラーの密入力 (`SimpleId::nyugyoku_scalar` が `Some`、CReLU のみ) を使う構成では、
+//!   FT 出力の後ろに入玉スカラー 96 列 (u8、127-scale) を連結する。`l1_in` は
+//!   [`SimpleId::combined_dim`] = FT 出力の連結 + 96
 //! - L1 dense: `l1_in → l1_out` + bias → CReLU / SCReLU
 //! - L2 dense: `l1_out → l2_out` + bias → CReLU / SCReLU
 //! - L3 dense: `l2_out → 1` + bias → スカラ net_output
@@ -50,7 +52,9 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::FeatureSetSpec;
+use shogi_features::{FeatureSetSpec, NYUGYOKU_SCALAR_DIMS, NyugyokuScalarConfig};
+
+use crate::simple_quantised::SimpleQuantised;
 
 // =============================================================================
 // constants
@@ -187,6 +191,10 @@ pub struct SimpleId {
     pub l1_out: usize,
     /// L2 dense 出力 (隠れ層 2) 次元。
     pub l2_out: usize,
+    /// `Some` のとき L1 の入力に入玉スカラー (`NYUGYOKU_SCALAR_DIMS` 列) を FT 出力の後ろに
+    /// 連結する。ルールと符号化は network hash / arch 文字列に含まれる。CReLU のみ対応
+    /// ([`SimpleId::validate`])。
+    pub nyugyoku_scalar: Option<NyugyokuScalarConfig>,
 }
 
 impl SimpleId {
@@ -195,12 +203,56 @@ impl SimpleId {
         self.feature_set.ft_in()
     }
 
-    /// L1 dense の入力次元 (= stm/nstm の FT post 出力を concat した次元)。
-    /// CReLU / SCReLU は `2 * ft_out`、Pairwise は pairwise 乗算で 1 perspective が
-    /// `ft_out / 2` に縮むため `ft_out`。
-    pub fn combined_dim(&self) -> usize {
+    /// stm/nstm の FT post 出力を concat した次元。CReLU / SCReLU は `2 * ft_out`、
+    /// Pairwise は pairwise 乗算で 1 perspective が `ft_out / 2` に縮むため `ft_out`。
+    pub fn ft_output_dim(&self) -> usize {
         2 * self.ft_out / self.activation.ft_output_divisor()
     }
+
+    /// L1 dense の入力次元 = [`ft_output_dim`](Self::ft_output_dim) (+ 入玉スカラーを
+    /// 使う構成では `NYUGYOKU_SCALAR_DIMS`)。入玉スカラーは列 `[ft_output_dim, combined_dim)`。
+    pub fn combined_dim(&self) -> usize {
+        let dense = if self.nyugyoku_scalar.is_some() {
+            NYUGYOKU_SCALAR_DIMS
+        } else {
+            0
+        };
+        self.ft_output_dim() + dense
+    }
+
+    /// 組み合わせの妥当性を検査する。入玉スカラーの密入力は CReLU のみ対応 (推論エンジン側の
+    /// 従来 NNUE の ClippedReLU 構成に合わせる)。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nyugyoku_scalar.is_some() && self.activation != SimpleActivation::CReLU {
+            return Err(format!(
+                "entering-king scalar inputs require the crelu activation (got {})",
+                self.activation.canonical_name()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 入玉スカラーの密入力を表す arch 文字列のトークン
+/// (例: `NyugyokuScalar(csa27,thermometer)[96]`)。YaneuraOu 側の入力層の構造文字列と同じ。
+pub fn nyugyoku_scalar_token(config: NyugyokuScalarConfig) -> String {
+    format!(
+        "NyugyokuScalar({},{})[{}]",
+        config.rule.canonical_name(),
+        config.encoding.canonical_name(),
+        NYUGYOKU_SCALAR_DIMS
+    )
+}
+
+/// 入玉スカラーの密入力の hash: [`nyugyoku_scalar_token`] の FNV-1a 32bit。L1 入力層の
+/// hash に XOR し、ルール・符号化の違うネットを読み込み時に区別する。
+pub fn nyugyoku_scalar_hash(config: NyugyokuScalarConfig) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in nyugyoku_scalar_token(config).bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 // =============================================================================
@@ -215,6 +267,16 @@ fn arch_identity(id: &SimpleId) -> String {
     let l1_out = id.l1_out;
     let l2_out = id.l2_out;
     let l1_input = id.combined_dim();
+    let ft_output = id.ft_output_dim();
+    // L1 入力層。入玉スカラーを使う構成では FT 出力 `[0, ft_output)` の後ろに密入力
+    // `[ft_output, l1_input)` が続くことを書く。
+    let input_slice = match id.nyugyoku_scalar {
+        None => format!("InputSlice[{l1_input}(0:{l1_input})]"),
+        Some(config) => format!(
+            "InputSlice[{l1_input}(0:{ft_output})+{}({ft_output}:{l1_input})]",
+            nyugyoku_scalar_token(config)
+        ),
+    };
     let act = id.activation.arch_token();
     // FT ブロックは活性化で 2 形式に分かれる。CReLU / SCReLU は `[ft_in->ft_outx2]`、
     // Pairwise は FT 出力を pairwise 乗算で半減するため `[ft_in->ft_out/2x2]-Pairwise`。
@@ -231,7 +293,7 @@ fn arch_identity(id: &SimpleId) -> String {
          AffineTransform[{}<-{}](\
          {}[{}](\
          AffineTransformSparseInput[{}<-{}](\
-         InputSlice[{}(0:{})])))))",
+         {})))))",
         id.feature_set.arch_feature_name(),
         ft_block,
         l2_out,   // Output layer input
@@ -242,9 +304,8 @@ fn arch_identity(id: &SimpleId) -> String {
         act,      // L1 出力の活性化
         l1_out,   // L1 output features
         l1_out,   // L2 input / L1 output
-        l1_input, // L1 input (FT post 出力の concat 次元)
-        l1_input, // InputSlice size
-        l1_input, // InputSlice range
+        l1_input, // L1 input (FT post 出力の concat 次元＋密入力)
+        input_slice,
     )
 }
 
@@ -258,9 +319,12 @@ pub fn build_arch_str(id: &SimpleId, fv_scale: i32) -> String {
 /// 層次元 (`l1_input` / `l1_out` / `l2_out`) のみに依存する。`l1_input` は L1 dense の
 /// 入力次元 (= FT post 出力の concat、`SimpleId::combined_dim`)。
 pub const fn compute_fc_hash(l1_input: usize, l1_out: usize, l2_out: usize) -> u32 {
-    // InputSlice hash (L1 dense input = FT post 出力の concat 次元)。
-    let mut prev_hash: u32 = 0xEC42E90D;
-    prev_hash ^= l1_input as u32;
+    compute_fc_hash_with_input_hash(0xEC42E90D ^ l1_input as u32, l1_out, l2_out)
+}
+
+/// 入力層の hash (`InputSlice` 相当) を与えて dense 層群の hash を求める。
+const fn compute_fc_hash_with_input_hash(input_hash: u32, l1_out: usize, l2_out: usize) -> u32 {
+    let mut prev_hash: u32 = input_hash;
 
     // FC 層の出力次元列: L1=l1_out / L2=l2_out / 出力=1。L1/L2 は活性化付き。
     // const fn なので index ベースの `while` で回す。
@@ -287,10 +351,19 @@ pub fn ft_hash(feature_hash: u32, ft_out: usize) -> u32 {
     feature_hash ^ (ft_out as u32 * 2)
 }
 
-/// network hash: `compute_fc_hash ^ ft_hash`。
+/// `id` の dense 層群の hash。入玉スカラーを使う構成では、入力層の hash
+/// (`0xEC42E90D ^ l1_input`) に [`nyugyoku_scalar_hash`] を XOR する。
+pub fn fc_hash(id: &SimpleId) -> u32 {
+    let mut input_hash = 0xEC42E90D ^ id.combined_dim() as u32;
+    if let Some(config) = id.nyugyoku_scalar {
+        input_hash ^= nyugyoku_scalar_hash(config);
+    }
+    compute_fc_hash_with_input_hash(input_hash, id.l1_out, id.l2_out)
+}
+
+/// network hash: `fc_hash ^ ft_hash`。
 pub fn network_hash(id: &SimpleId) -> u32 {
-    compute_fc_hash(id.combined_dim(), id.l1_out, id.l2_out)
-        ^ ft_hash(id.feature_set.feature_hash(), id.ft_out)
+    fc_hash(id) ^ ft_hash(id.feature_set.feature_hash(), id.ft_out)
 }
 
 // =============================================================================
@@ -371,6 +444,9 @@ impl SimpleWeights {
     /// Simple quantised binary を `writer` に書き出す。weight buffer の長さが
     /// `id` の層次元と不整合なら、書き出し前に `InvalidInput` で返す。
     pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.id
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         self.check_buffer_lengths()?;
         let id = &self.id;
 
@@ -396,8 +472,7 @@ impl SimpleWeights {
         write_i16_quantised(writer, &self.ft_w, qa)?;
 
         // ---- dense topology hash ----
-        writer
-            .write_all(&compute_fc_hash(id.combined_dim(), id.l1_out, id.l2_out).to_le_bytes())?;
+        writer.write_all(&fc_hash(id).to_le_bytes())?;
 
         // ---- dense layers (bias i32 scale 127*QB, weight i8 scale QB) ----
         let bias_scale = (FT_OUTPUT_QA * QB) as f64;
@@ -431,118 +506,129 @@ impl SimpleWeights {
     /// (feature set / 活性化 / 層次元)。file の version・hash・arch identity が
     /// `expected` 由来の値と一致しなければ `InvalidData` で reject する。
     pub fn load<R: Read>(reader: &mut R, expected: SimpleId) -> io::Result<Self> {
-        let mut buf4 = [0u8; 4];
-
-        // version
-        reader.read_exact(&mut buf4)?;
-        let version = u32::from_le_bytes(buf4);
-        if version != NNUE_VERSION {
-            return Err(invalid(format!(
-                "unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x})"
-            )));
-        }
-
-        // network_hash
-        reader.read_exact(&mut buf4)?;
-        let file_network_hash = u32::from_le_bytes(buf4);
-        let expected_network_hash = network_hash(&expected);
-        if file_network_hash != expected_network_hash {
-            return Err(invalid(format!(
-                "network_hash mismatch: file {file_network_hash:#x}, \
-                 expected {expected_network_hash:#x}"
-            )));
-        }
-
-        // arch_str
-        reader.read_exact(&mut buf4)?;
-        let arch_len = u32::from_le_bytes(buf4) as usize;
-        if arch_len == 0 || arch_len > 16384 {
-            return Err(invalid(format!("invalid arch_len: {arch_len}")));
-        }
-        let mut arch_bytes = vec![0u8; arch_len];
-        reader.read_exact(&mut arch_bytes)?;
-        let arch_str = String::from_utf8(arch_bytes)
-            .map_err(|e| invalid(format!("arch_str is not valid UTF-8: {e}")))?;
-        // identity 部 (`,fv_scale=` の手前) を expected から組んだ値と照合する。
-        let (file_identity, fv_scale_str) = arch_str
-            .rsplit_once(",fv_scale=")
-            .ok_or_else(|| invalid(format!("arch_str missing fv_scale field: `{arch_str}`")))?;
-        let expected_identity = arch_identity(&expected);
-        if file_identity != expected_identity {
-            return Err(invalid(format!(
-                "arch identity mismatch: file `{file_identity}`, expected `{expected_identity}`"
-            )));
-        }
-        let fv_scale: i32 = fv_scale_str
-            .parse()
-            .map_err(|_| invalid(format!("invalid fv_scale in arch_str: `{fv_scale_str}`")))?;
-        if fv_scale <= 0 {
-            return Err(invalid(format!(
-                "invalid fv_scale in arch_str: `{fv_scale_str}` (must be positive)"
-            )));
-        }
-
-        // ft_hash
-        reader.read_exact(&mut buf4)?;
-        let file_ft_hash = u32::from_le_bytes(buf4);
-        let expected_ft_hash = ft_hash(expected.feature_set.feature_hash(), expected.ft_out);
-        if file_ft_hash != expected_ft_hash {
-            return Err(invalid(format!(
-                "ft_hash mismatch: file {file_ft_hash:#x}, expected {expected_ft_hash:#x}"
-            )));
-        }
-
-        // FT biases / weights (i16, scale = QA)
+        let q = SimpleQuantised::read(reader, expected)?;
         let qa = expected.activation.qa() as f32;
-        let ft_b = read_i16_quantised(reader, expected.ft_out, qa)?;
-        let ft_w = read_i16_quantised(reader, expected.ft_in() * expected.ft_out, qa)?;
-
-        // dense topology hash
-        reader.read_exact(&mut buf4)?;
-        let file_fc_hash = u32::from_le_bytes(buf4);
-        let expected_fc_hash =
-            compute_fc_hash(expected.combined_dim(), expected.l1_out, expected.l2_out);
-        if file_fc_hash != expected_fc_hash {
-            return Err(invalid(format!(
-                "fc_hash mismatch: file {file_fc_hash:#x}, expected {expected_fc_hash:#x}"
-            )));
-        }
-
-        // dense layers
         let bias_scale = (FT_OUTPUT_QA * QB) as f32;
         let weight_scale = QB as f32;
-        let l1_b = read_i32_bias(reader, expected.l1_out, bias_scale)?;
-        let l1_w = read_i8_weight(
-            reader,
-            expected.l1_out,
-            expected.combined_dim(),
-            weight_scale,
-        )?;
-        let l2_b = read_i32_bias(reader, expected.l2_out, bias_scale)?;
-        let l2_w = read_i8_weight(reader, expected.l2_out, expected.l1_out, weight_scale)?;
-        let l3_b = read_i32_bias(reader, 1, bias_scale)?;
-        let l3_w = read_i8_weight(reader, 1, expected.l2_out, weight_scale)?;
-
+        let i16s = |v: &[i16], scale: f32| v.iter().map(|&x| x as f32 / scale).collect();
+        let i32s = |v: &[i32]| v.iter().map(|&x| x as f32 / bias_scale).collect();
+        // i8 weight は `pad32(in_dim)` 幅で保持しているので padding 列を捨てる。
+        let i8s = |v: &[i8], out_dim: usize, in_dim: usize| {
+            let padded = pad32(in_dim);
+            let mut out = Vec::with_capacity(out_dim * in_dim);
+            for o in 0..out_dim {
+                out.extend(
+                    v[o * padded..o * padded + in_dim]
+                        .iter()
+                        .map(|&x| x as f32 / weight_scale),
+                );
+            }
+            out
+        };
         Ok(Self {
             id: expected,
-            fv_scale,
-            ft_w,
-            ft_b,
-            l1_w,
-            l1_b,
-            l2_w,
-            l2_b,
-            l3_w,
-            l3_b,
+            fv_scale: q.fv_scale,
+            ft_w: i16s(&q.ft_w, qa),
+            ft_b: i16s(&q.ft_b, qa),
+            l1_w: i8s(&q.l1_w, expected.l1_out, expected.combined_dim()),
+            l1_b: i32s(&q.l1_b),
+            l2_w: i8s(&q.l2_w, expected.l2_out, expected.l1_out),
+            l2_b: i32s(&q.l2_b),
+            l3_w: i8s(&q.l3_w, 1, expected.l2_out),
+            l3_b: i32s(&q.l3_b),
         })
     }
+}
+
+/// Simple quantised binary の header (version・network hash・arch 文字列) を読み、`expected`
+/// と照合して arch 文字列の `fv_scale` を返す。
+pub(crate) fn read_header<R: Read>(reader: &mut R, expected: &SimpleId) -> io::Result<i32> {
+    let mut buf4 = [0u8; 4];
+
+    // version
+    reader.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    if version != NNUE_VERSION {
+        return Err(invalid(format!(
+            "unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x})"
+        )));
+    }
+
+    // network_hash
+    reader.read_exact(&mut buf4)?;
+    let file_network_hash = u32::from_le_bytes(buf4);
+    let expected_network_hash = network_hash(expected);
+    if file_network_hash != expected_network_hash {
+        return Err(invalid(format!(
+            "network_hash mismatch: file {file_network_hash:#x}, \
+             expected {expected_network_hash:#x}"
+        )));
+    }
+
+    // arch_str
+    reader.read_exact(&mut buf4)?;
+    let arch_len = u32::from_le_bytes(buf4) as usize;
+    if arch_len == 0 || arch_len > 16384 {
+        return Err(invalid(format!("invalid arch_len: {arch_len}")));
+    }
+    let mut arch_bytes = vec![0u8; arch_len];
+    reader.read_exact(&mut arch_bytes)?;
+    let arch_str = String::from_utf8(arch_bytes)
+        .map_err(|e| invalid(format!("arch_str is not valid UTF-8: {e}")))?;
+    // identity 部 (`,fv_scale=` の手前) を expected から組んだ値と照合する。
+    let (file_identity, fv_scale_str) = arch_str
+        .rsplit_once(",fv_scale=")
+        .ok_or_else(|| invalid(format!("arch_str missing fv_scale field: `{arch_str}`")))?;
+    let expected_identity = arch_identity(expected);
+    if file_identity != expected_identity {
+        return Err(invalid(format!(
+            "arch identity mismatch: file `{file_identity}`, expected `{expected_identity}`"
+        )));
+    }
+    let fv_scale: i32 = fv_scale_str
+        .parse()
+        .map_err(|_| invalid(format!("invalid fv_scale in arch_str: `{fv_scale_str}`")))?;
+    if fv_scale <= 0 {
+        return Err(invalid(format!(
+            "invalid fv_scale in arch_str: `{fv_scale_str}` (must be positive)"
+        )));
+    }
+    Ok(fv_scale)
+}
+
+/// FT hash を読んで `expected` と照合する。
+pub(crate) fn read_ft_hash<R: Read>(reader: &mut R, expected: &SimpleId) -> io::Result<()> {
+    let mut buf4 = [0u8; 4];
+    reader.read_exact(&mut buf4)?;
+    let file_ft_hash = u32::from_le_bytes(buf4);
+    let expected_ft_hash = ft_hash(expected.feature_set.feature_hash(), expected.ft_out);
+    if file_ft_hash != expected_ft_hash {
+        return Err(invalid(format!(
+            "ft_hash mismatch: file {file_ft_hash:#x}, expected {expected_ft_hash:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// dense 層群の hash を読んで `expected` と照合する。
+pub(crate) fn read_fc_hash<R: Read>(reader: &mut R, expected: &SimpleId) -> io::Result<()> {
+    let mut buf4 = [0u8; 4];
+    reader.read_exact(&mut buf4)?;
+    let file_fc_hash = u32::from_le_bytes(buf4);
+    let expected_fc_hash = fc_hash(expected);
+    if file_fc_hash != expected_fc_hash {
+        return Err(invalid(format!(
+            "fc_hash mismatch: file {file_fc_hash:#x}, expected {expected_fc_hash:#x}"
+        )));
+    }
+    Ok(())
 }
 
 // =============================================================================
 // quantise / dequantise helpers
 // =============================================================================
 
-fn invalid(msg: String) -> io::Error {
+pub(crate) fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
@@ -628,17 +714,6 @@ fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
     }
 }
 
-/// `n` 個の i16 (raw LE) を読み、`scale` で割って f32 列に戻す。
-fn read_i16_quantised<R: Read>(reader: &mut R, n: usize, scale: f32) -> io::Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(n);
-    let mut buf = [0u8; 2];
-    for _ in 0..n {
-        reader.read_exact(&mut buf)?;
-        out.push(i16::from_le_bytes(buf) as f32 / scale);
-    }
-    Ok(out)
-}
-
 /// bias 列を `scale` 倍して i32 量子化し書く。
 fn write_i32_bias<W: Write>(writer: &mut W, values: &[f32], scale: f64) -> io::Result<()> {
     for &v in values {
@@ -646,17 +721,6 @@ fn write_i32_bias<W: Write>(writer: &mut W, values: &[f32], scale: f64) -> io::R
         writer.write_all(&q.to_le_bytes())?;
     }
     Ok(())
-}
-
-/// `n` 個の i32 bias を読み、`scale` で割って戻す。
-fn read_i32_bias<R: Read>(reader: &mut R, n: usize, scale: f32) -> io::Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(n);
-    let mut buf = [0u8; 4];
-    for _ in 0..n {
-        reader.read_exact(&mut buf)?;
-        out.push(i32::from_le_bytes(buf) as f32 / scale);
-    }
-    Ok(out)
 }
 
 /// row-major weight `(out_dim, in_dim)` を `pad32(in_dim)` 幅に pad しながら
@@ -680,28 +744,6 @@ fn write_i8_weight<W: Write>(
         }
     }
     Ok(())
-}
-
-/// `pad32(in_dim)` 幅で書かれた i8 weight を読み、padding を捨て row-major
-/// `(out_dim, in_dim)` の f32 に戻す。
-fn read_i8_weight<R: Read>(
-    reader: &mut R,
-    out_dim: usize,
-    in_dim: usize,
-    scale: f32,
-) -> io::Result<Vec<f32>> {
-    let padded_in = pad32(in_dim);
-    let mut out = vec![0.0_f32; out_dim * in_dim];
-    let mut buf = [0u8; 1];
-    for o in 0..out_dim {
-        for in_idx in 0..padded_in {
-            reader.read_exact(&mut buf)?;
-            if in_idx < in_dim {
-                out[o * in_dim + in_idx] = buf[0] as i8 as f32 / scale;
-            }
-        }
-    }
-    Ok(out)
 }
 
 // =============================================================================
@@ -781,6 +823,7 @@ mod tests {
             ft_out: 256,
             l1_out: 32,
             l2_out: 32,
+            nyugyoku_scalar: None,
         }
     }
 

@@ -1842,3 +1842,81 @@ fn cycle_wdl_flags_parse_and_build() {
     let invalid = simple_cli(&["--validation-wdl", "1.5"]);
     assert!(build_wdl_scheduler(&invalid).is_err());
 }
+
+/// `nnue-train simple <simple flags...>` を parse して `SimpleArgs` を返す helper。
+fn simple_args(argv: &[&str]) -> crate::cli::SimpleArgs {
+    let mut full = vec!["nnue-train", "simple"];
+    full.extend_from_slice(argv);
+    match Cli::try_parse_from(full)
+        .expect("simple cli should parse")
+        .arch
+    {
+        crate::cli::ArchCommand::Simple(args) => args,
+        other => panic!("expected simple subcommand, got {other:?}"),
+    }
+}
+
+#[test]
+fn simple_nyugyoku_scalar_flags_parse_into_config() {
+    use crate::training::simple_nyugyoku_scalar;
+    use nnue_format::SimpleActivation;
+    use shogi_features::{DeclarationRule, NyugyokuScalarConfig, ScalarEncoding};
+
+    assert_eq!(
+        simple_nyugyoku_scalar(&simple_args(&[]), SimpleActivation::CReLU),
+        Ok(None)
+    );
+    assert_eq!(
+        simple_nyugyoku_scalar(
+            &simple_args(&["--nyugyoku-rule", "csa27"]),
+            SimpleActivation::CReLU
+        ),
+        Ok(Some(NyugyokuScalarConfig::default()))
+    );
+    assert_eq!(
+        simple_nyugyoku_scalar(
+            &simple_args(&["--nyugyoku-rule", "csa24", "--nyugyoku-encoding", "onehot"]),
+            SimpleActivation::CReLU
+        ),
+        Ok(Some(NyugyokuScalarConfig {
+            rule: DeclarationRule::Csa24,
+            encoding: ScalarEncoding::OneHot,
+        }))
+    );
+    for (argv, activation) in [
+        (
+            &["--nyugyoku-encoding", "onehot"][..],
+            SimpleActivation::CReLU,
+        ),
+        (&["--nyugyoku-rule", "csa27h"][..], SimpleActivation::CReLU),
+        (
+            &["--nyugyoku-rule", "csa27", "--nyugyoku-encoding", "binary"][..],
+            SimpleActivation::CReLU,
+        ),
+        (&["--nyugyoku-rule", "csa27"][..], SimpleActivation::SCReLU),
+        (
+            &["--nyugyoku-rule", "csa27"][..],
+            SimpleActivation::Pairwise,
+        ),
+    ] {
+        assert!(
+            simple_nyugyoku_scalar(&simple_args(argv), activation).is_err(),
+            "{argv:?} {activation:?}"
+        );
+    }
+}
+
+/// rescore は Simple では使えないので、入玉スカラーつきの指定でも黙って動かずエラーになる。
+#[test]
+fn simple_rescore_is_rejected_with_nyugyoku_scalars() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--rescore-input",
+        "x.psv",
+        "simple",
+        "--nyugyoku-rule",
+        "csa27",
+    ])
+    .unwrap();
+    assert!(reject_simple_unsupported_flags(&cli).is_err());
+}

@@ -122,6 +122,7 @@ GPU学習器 **tatara**（Rust）に、YaneuraOu-NNUE-features の実験的特�
   - 公開 `FeatureSet` は `HalfKp` / `HalfKaSplit` / `HalfKaMerged` / `HalfKaHmSplit` / `HalfKaHmMerged` の5種（15プリセットは未実装）。`HalfKp` のハッシュ `0x5D69D5B8` は YaneuraOu の `HalfKP<Friend>` と一致。
   - Simple trainer は FT出力を連結済みバッファ `combined`（`batch × combined_dim`）に書き、L1 は cuBLAS Sgemm でそれを読む。L1 入力次元の定義は `SimpleId::combined_dim()` の1か所。
   - 既定 backend は CUDA C++（`native`）、cuda-oxide の Rust カーネルは比較用 oracle。カーネルを変えるときは両方を直す。
+  - HalfKP の欠けた駒の扱いが tatara とやねうら王で違う: やねうら王は常に 38 個の index を出し、盤上・手駒に無い駒を `BONA_PIECE_ZERO`（index `玉マス * fe_end`）として数える。tatara は存在する駒だけを出す。駒落ち・駒箱のある局面でだけ FT が食い違う（平手の対局から作る教師データには影響しない。段階5の突合で判明、詳細は ADR §8）
   - **CPU で学習を回すモードは無い**。カーネル単位の CPU 参照実装（`gpu-kernels` の `*_cpu`）はあり、CUDA なしでビルドできる。量子化 CPU forward は LayerStack 用（`eval_sfen`）だけで、Simple 用は無い。
 - `King24AttackEffect/DefenseEffect` は盤外マスをスキップするため手番側/相手側で活性数が非対称になる → nnz内の `-1` パディング契約が必要。
 - 利き数の定義（遮蔽考慮・影の利きを数えない）がエンジンとズレると、学習は収束するのに実戦で弱くなる。**利き系特徴（B1・B2）でも同じリスク**があるため、エンジン側に一時的なindex dumpを生やして突合すること。
@@ -306,8 +307,10 @@ NyugyokuScalar[96]（手番順、u8 0〜127）──┐
    - T: スカラー列は int8（`round(x*127)`）。L1重みの列順は「FT列 → スカラー列」、パディングは32の倍数。`--scale 508` 前提（§3）
    - T・Y: 新ハッシュ値（符号化種別・ルール種別を含める）を採番し、byte-golden テストで出力バイト列を固定
    - Y: forward 直前にスカラー96次元を構築して L1 入力末尾に連結。L1 入力次元を 512→608 に拡張。ビルドフラグ（例: `NNUE_ARCHITECTURE_HALFKP_NYUGYOKU`）で既存アーキと切り替え
+     - 実装（段階5b）: 評価関数ファイル上の L1 は 608 入力のまま、推論では96次元を作らず、読み込み時に作る「玉の状態 → L1 への寄与」の表を引いて足す（integer-exact は不変）。玉の状態は直前の手で変わり得ない玉について親局面から引き継ぐ。NPS 低下は同じ探索木で約4%
    - Y: **新アーキのビルドではハッシュ不一致をエラーにする**（従来 NNUE は警告のみ。§1.1）
    - Y: ネットのルール種別とエンジンの `EnteringKingRule` が食い違う場合はロード時に警告する
+   - 結果（integer-exact 突合・NPS・改善案）は tatara `docs/adr-nyugyoku-scalar-input.md` §8、NPS 低下への対策（段階5b）は §9
    - T: **Simple 用の量子化 CPU forward を追加する**（FT i16 累積 → u8 化 → i8 アフィン `>> 6` …とエンジンと同じ整数演算）。GPU なしで integer-exact 突合を行うのに使う
 6. **検証**
    - §1.2 の4段階。まずランダム1万局面で T と Y のスカラー値（int8化後）を突合し、その後 integer-exact（T の量子化 forward と Y の `Evaluate()` が±0で一致）
@@ -500,7 +503,9 @@ FT出力512 ─→ 本線 32-32-1 (eval)      loss = 通常のeval/勝敗混合
 - **段階1で必ず確認すること**: tatara に CPU 版の forward/backward（または CPU で学習を回すモード）があるか。あれば、GPU 未構築のうちに「数ステップ学習して loss が減る」まで CPU で確認できる
 - **GPU 環境が整ったら**: draft PR の保留項目（GPU/CPU 同等性、smoke、ワームスタートの関数保存）を消化してから本マージする
 - **GPU 検証待ちの項目（チェックリスト）**: GPU 環境が整うまで保留し、整ったら以下を消化する
-  - [ ] `cargo check -p nnue-trainer`（既定 feature = native CUDA）で、GPU 限定コードを型検査する。段階3で `bins/nnue_train/src/training.rs` の GPU 限定の関数に入れた変更（`TrainingConfig::nyugyoku_scalar` の初期化 2 か所、eval-only の held-out 読み込みの引数 1 つ）と、段階5で GPU 限定コードに入れる変更が対象
+  - [ ] `cargo check -p nnue-trainer`（既定 feature = native CUDA）で、GPU 限定コードを型検査する。対象:
+    - 段階3: `bins/nnue_train/src/training.rs` の GPU 限定の関数に入れた変更（`TrainingConfig::nyugyoku_scalar` の初期化 2 か所、eval-only の held-out 読み込みの引数 1 つ）
+    - 段階5: `run_simple_training` の `--nyugyoku-rule` の解釈と拒否、`SimpleId` の初期化、`TrainingConfig::nyugyoku_scalar`（`training.rs`）、`SimpleGpuTrainer::new` の拒否（`trainer_simple.rs`）、GPU 限定のテスト・smoke・bench の `SimpleId` リテラルへの `nyugyoku_scalar: None` 追加（`smoke.rs`、`native_bench.rs`、`tests/gpu_cpu_equivalence_tests.rs`、`tests/native_cuda_tests.rs`）
   - [ ] `bash scripts/local-ci.sh` が全 crate で PASS（tatara の push 前規約）
   - [ ] 段階4の GPU/CPU 同等性・smoke・ワームスタートの関数保存（段階4の項を参照）
 - 本番学習の GPU は別途検討（T1000 では batch とネット幅の制約が大きい）

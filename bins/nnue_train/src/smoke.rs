@@ -61,6 +61,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         ft_out: 256,
         l1_out: 32,
         l2_out: 32,
+        nyugyoku_scalar: None,
     };
     let smoke_fv_scale = 16_i32;
     let smoke_weight_decay = 1e-7_f32;
