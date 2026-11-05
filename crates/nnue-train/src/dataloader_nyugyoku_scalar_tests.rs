@@ -232,3 +232,55 @@ fn missing_king_is_an_error_with_scalars() {
     assert_eq!(with.stm_indices, before.stm_indices);
     assert_eq!(with.nyugyoku_scalars, before.nyugyoku_scalars);
 }
+
+/// HCPE 入力でも、loader が詰めたスカラーは同じ record を復号した盤面から直接計算した
+/// スカラーと一致する (HCPE のエンコーダは無いので、golden ではなく直接計算と比べる)。
+#[test]
+fn hcpe_loader_matches_direct_computation() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("shogi-format/tests/data/sample.hcpe");
+    let size = std::fs::metadata(&path).unwrap().len();
+    let mut direct = super::HcpeFileLoader::new(&path).unwrap();
+    let mut boards = Vec::new();
+    while let Some(board) = direct.next_board().unwrap() {
+        boards.push(board);
+    }
+    assert_eq!(boards.len(), 100);
+
+    for config in configs() {
+        // batch_size = 局面数なので、各 batch は 1 epoch 分をファイル順に持つ。
+        let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &path,
+            boards.len(),
+            None,
+            None,
+            2,
+            BucketMode::KingRank9,
+            spec(),
+            false,
+            1,
+            size,
+            false,
+            None,
+            0,
+            false,
+            0,
+            Some(config),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let (batch, buckets) = loader.next_batch().unwrap().unwrap();
+            assert_eq!(batch.n_positions, boards.len());
+            for (bi, board) in boards.iter().enumerate() {
+                assert_eq!(
+                    batch.nyugyoku_scalar_row(bi).unwrap(),
+                    shogi_features::nyugyoku_scalars(board, config).as_slice(),
+                    "record {bi} {config:?}"
+                );
+            }
+            loader.recycle((batch, buckets));
+        }
+    }
+}

@@ -318,3 +318,13 @@ BonaPiece、ハッシュ `0xA20DCB9B`) が既にある。仕様書の「A2」と
   約 220 ns から約 80 ns に減らした。
 - 学習 loader 全体では decode と I/O の比重が大きいので低下は 5〜8%。GPU 学習では loader の
   worker 数を増やせば吸収できる範囲と見ている (実際の学習速度への影響は段階4で GPU を使って確認する)。
+
+### 判断 (hs)
+
+- 学習 loader 全体で -5〜-8% の低下は**現時点では許容**する。本番学習で dataloader が GPU の
+  律速になった場合に再検討する (候補: worker 数の増加、スカラー計算の更なる表引き化、
+  decode と同じ盤面走査への統合)。
+- rescore と単一 worker の `PrefetchedLoader` は、スカラーありのアーキが指定されたら黙って
+  スカラーなしで動かさず、エラーにする (CLI を入れる段階5で実装)。
+- HCPE 経路は、HCPE エンコーダを作らず「loader が詰めたスカラー」と「同じ record を復号した
+  盤面から直接計算したスカラー」の一致で検証する (`hcpe_loader_matches_direct_computation`)。
