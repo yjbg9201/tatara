@@ -86,6 +86,7 @@ fn spawn_controlled_reader(reader: TrainingPsvReader) -> BucketedPrefetchedLoade
         true,
         9,
         false,
+        None,
         reader,
         Path::new("teacher.psv"),
     )
@@ -194,6 +195,7 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
                 buffer_mib,
                 false,
                 0,
+                None,
             )
             .unwrap();
             let slot = loader.next_batch().unwrap().expect("first batch");

@@ -499,6 +499,10 @@ FT出力512 ─→ 本線 32-32-1 (eval)      loss = 通常のeval/勝敗混合
 - **最後に回して検証を保留する**: 段階4（GPU カーネルの行幅引数化・trainer の変更）。PR は **draft のまま**にし、本文に「GPU 未検証」と明記する。未検証のテスト項目をチェックリストで残す
 - **段階1で必ず確認すること**: tatara に CPU 版の forward/backward（または CPU で学習を回すモード）があるか。あれば、GPU 未構築のうちに「数ステップ学習して loss が減る」まで CPU で確認できる
 - **GPU 環境が整ったら**: draft PR の保留項目（GPU/CPU 同等性、smoke、ワームスタートの関数保存）を消化してから本マージする
+- **GPU 検証待ちの項目（チェックリスト）**: GPU 環境が整うまで保留し、整ったら以下を消化する
+  - [ ] `cargo check -p nnue-trainer`（既定 feature = native CUDA）で、GPU 限定コードを型検査する。段階3で `bins/nnue_train/src/training.rs` の GPU 限定の関数に入れた変更（`TrainingConfig::nyugyoku_scalar` の初期化 2 か所、eval-only の held-out 読み込みの引数 1 つ）と、段階5で GPU 限定コードに入れる変更が対象
+  - [ ] `bash scripts/local-ci.sh` が全 crate で PASS（tatara の push 前規約）
+  - [ ] 段階4の GPU/CPU 同等性・smoke・ワームスタートの関数保存（段階4の項を参照）
 - 本番学習の GPU は別途検討（T1000 では batch とネット幅の制約が大きい）
 
 ---

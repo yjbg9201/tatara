@@ -34,8 +34,8 @@ pub use halfka_hm::{
 pub use kingrank9::{KINGRANK9_NUM_BUCKETS, kingrank9_bucket_board};
 pub use nyugyoku_scalar::{
     DeclarationRule, KingDeclarationState, NYUGYOKU_SCALAR_BLOCK_DIMS, NYUGYOKU_SCALAR_DIMS,
-    NyugyokuScalarConfig, ScalarEncoding, king_declaration_state, nyugyoku_scalars,
-    nyugyoku_scalars_f32,
+    NyugyokuScalarConfig, ScalarEncoding, king_declaration_state, king_declaration_states,
+    nyugyoku_scalars, nyugyoku_scalars_f32, write_nyugyoku_scalars,
 };
 pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};

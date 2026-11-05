@@ -41,6 +41,7 @@ fn training_loader_with_source(
         buffer_mib,
         false,
         0,
+        None,
     )
 }
 
@@ -101,6 +102,7 @@ fn sidecar_and_dual_labels_keep_feature_payload_with_windowed_training() {
         FeatureSet::HalfKaHmMerged.spec(),
         9,
         Some(ScoreSource::DualLabel(DualLabelMode::All)),
+        None,
     )
     .unwrap();
     assert_eq!(heldout.n_positions(), 3);
