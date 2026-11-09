@@ -119,3 +119,16 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 
 - native CUDA 既定 backend / cuda-oxide oracle / nightly toolchain の構成は壊さない、
   host 側 unsafe は妥当性をコメントで明記する
+
+## NNUE 新アーキテクチャ作業（このフォーク固有）
+
+YaneuraOu（`yjbg9201/YaneuraOu`）と同時に改造する NNUE 新アーキテクチャの仕様・アイデア一覧・
+共通規約は [docs/nnue-architecture-ideas.md](docs/nnue-architecture-ideas.md)、個別アイデアの
+調査結果と決定事項は [docs/adr/](docs/adr/) にある。feature set / threat / Simple / export に
+触れる作業の前に読むこと。
+
+- 1 回の作業では 1 アイデア（ID 指定）だけを扱う。仕様書と実ソースが食い違う場合は実ソースを
+  優先し、差異を報告する。
+- この 2 つはリポジトリ所有者の指示で置いている作業計画文書で、上記「ドキュメント規約」の
+  dated header 禁止・ADR 禁止の例外として扱う。upstream の規約とは相容れないため、upstream
+  向けの変更には含めない。
